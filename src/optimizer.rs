@@ -1,0 +1,554 @@
+//! Image decoding, resizing and encoding to web formats.
+
+use std::fs;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail};
+use image::{DynamicImage, ImageDecoder, ImageReader, imageops::FilterType};
+use serde::{Deserialize, Serialize};
+
+/// Output formats the optimizer can produce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Format {
+    Jpeg,
+    WebP,
+    Avif,
+    Png,
+}
+
+impl Format {
+    pub const ALL: [Format; 4] = [Format::Jpeg, Format::WebP, Format::Avif, Format::Png];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Format::Jpeg => "JPEG",
+            Format::WebP => "WebP",
+            Format::Avif => "AVIF",
+            Format::Png => "PNG",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Jpeg => "jpg",
+            Format::WebP => "webp",
+            Format::Avif => "avif",
+            Format::Png => "png",
+        }
+    }
+
+}
+
+/// Where optimized files are written.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputLocation {
+    /// An `optimized` folder next to each source (or inside a dropped folder).
+    Subfolder,
+    /// A user-chosen directory.
+    Custom(PathBuf),
+}
+
+pub const SUBFOLDER_NAME: &str = "optimized";
+
+/// How images are resized when resizing is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResizeMode {
+    /// Shrink to fit within `max_width` x `max_height`.
+    #[default]
+    FitWithin,
+    /// Scale both sides by `resize_percent`.
+    Percent,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub jpeg: bool,
+    pub webp: bool,
+    pub avif: bool,
+    pub png: bool,
+
+    pub jpeg_quality: u8,
+    pub webp_quality: u8,
+    pub webp_lossless: bool,
+    pub avif_quality: u8,
+    /// 1 (slowest, smallest) ..= 10 (fastest)
+    pub avif_speed: u8,
+    /// oxipng preset 0 ..= 6
+    pub png_level: u8,
+
+    pub resize: bool,
+    pub resize_mode: ResizeMode,
+    pub max_width: u32,
+    pub max_height: u32,
+    /// 1 ..= 100, used by `ResizeMode::Percent`.
+    pub resize_percent: u32,
+
+    pub output: OutputLocation,
+    /// Don't write an output that is not smaller than the original file.
+    pub skip_if_larger: bool,
+    pub overwrite: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            jpeg: false,
+            webp: true,
+            avif: false,
+            png: false,
+            jpeg_quality: 80,
+            webp_quality: 80,
+            webp_lossless: false,
+            avif_quality: 65,
+            avif_speed: 6,
+            png_level: 2,
+            resize: false,
+            resize_mode: ResizeMode::FitWithin,
+            max_width: 1920,
+            max_height: 1920,
+            resize_percent: 50,
+            output: OutputLocation::Subfolder,
+            skip_if_larger: true,
+            overwrite: true,
+        }
+    }
+}
+
+impl Settings {
+    pub fn enabled(&self, f: Format) -> bool {
+        match f {
+            Format::Jpeg => self.jpeg,
+            Format::WebP => self.webp,
+            Format::Avif => self.avif,
+            Format::Png => self.png,
+        }
+    }
+
+
+    pub fn formats(&self) -> Vec<Format> {
+        Format::ALL.into_iter().filter(|f| self.enabled(*f)).collect()
+    }
+}
+
+/// One source image plus where its outputs go.
+#[derive(Clone, Debug)]
+pub struct Source {
+    pub path: PathBuf,
+    /// Directory the outputs are written into (before applying a custom output dir).
+    pub default_out_dir: PathBuf,
+    /// Sub path to use below a custom output directory (keeps folder structure).
+    pub custom_rel_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub enum Outcome {
+    Written { path: PathBuf, size: u64 },
+    /// Encoded but not written because it was not smaller than the original.
+    Larger { size: u64 },
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct FormatResult {
+    pub format: Format,
+    pub outcome: Outcome,
+}
+
+pub fn output_dir(src: &Source, settings: &Settings) -> PathBuf {
+    match &settings.output {
+        OutputLocation::Subfolder => src.default_out_dir.clone(),
+        OutputLocation::Custom(dir) => dir.join(&src.custom_rel_dir),
+    }
+}
+
+/// New dimensions for a `w` x `h` image, or `None` if it should keep its size.
+/// Keeps the aspect ratio and never upscales.
+pub fn target_size(w: u32, h: u32, settings: &Settings) -> Option<(u32, u32)> {
+    if !settings.resize || w == 0 || h == 0 {
+        return None;
+    }
+    let scale = match settings.resize_mode {
+        ResizeMode::FitWithin => {
+            let limit = |max: u32, side: u32| if max == 0 { 1.0 } else { max as f64 / side as f64 };
+            limit(settings.max_width, w).min(limit(settings.max_height, h))
+        }
+        ResizeMode::Percent => settings.resize_percent.clamp(1, 100) as f64 / 100.0,
+    };
+    if scale >= 1.0 {
+        return None;
+    }
+    let new = |side: u32| ((side as f64 * scale).round() as u32).max(1);
+    Some((new(w), new(h)))
+}
+
+/// Decode, optionally resize and encode one source to every enabled format.
+pub fn process(src: &Source, settings: &Settings) -> Result<Vec<FormatResult>> {
+    let original_bytes = fs::read(&src.path).with_context(|| format!("reading {}", src.path.display()))?;
+    let original_size = original_bytes.len() as u64;
+
+    let mut img = decode(&original_bytes)?;
+    let target = target_size(img.width(), img.height(), settings);
+    let resized = target.is_some();
+    if let Some((w, h)) = target {
+        img = img.resize_exact(w, h, FilterType::Lanczos3);
+    }
+
+    let source_is_png = image::guess_format(&original_bytes).ok() == Some(image::ImageFormat::Png);
+    let out_dir = output_dir(src, settings);
+    let stem = src
+        .path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "image".into());
+
+    let results = settings
+        .formats()
+        .into_iter()
+        .map(|format| {
+            let encoded = catch_unwind(AssertUnwindSafe(|| match format {
+                Format::Jpeg => encode_jpeg(&img, settings.jpeg_quality),
+                Format::WebP => encode_webp(&img, settings.webp_quality, settings.webp_lossless),
+                Format::Avif => encode_avif(&img, settings.avif_quality, settings.avif_speed),
+                Format::Png => {
+                    // Re-compress the original PNG directly when possible: keeps palettes/bit depth.
+                    let input = if source_is_png && !resized { Some(&original_bytes[..]) } else { None };
+                    encode_png(&img, input, settings.png_level)
+                }
+            }))
+            .unwrap_or_else(|_| Err(anyhow!("encoder crashed")));
+
+            let outcome = match encoded {
+                Err(e) => Outcome::Failed(format!("{e:#}")),
+                Ok(data) => {
+                    let size = data.len() as u64;
+                    if settings.skip_if_larger && size >= original_size {
+                        Outcome::Larger { size }
+                    } else {
+                        let path = out_dir.join(format!("{stem}.{}", format.extension()));
+                        match write_output(&path, &data, settings.overwrite) {
+                            Ok(path) => Outcome::Written { path, size },
+                            Err(e) => Outcome::Failed(format!("{e:#}")),
+                        }
+                    }
+                }
+            };
+            FormatResult { format, outcome }
+        })
+        .collect();
+
+    Ok(results)
+}
+
+fn write_output(path: &Path, data: &[u8], overwrite: bool) -> Result<PathBuf> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let path = if overwrite || !path.exists() { path.to_path_buf() } else { unique_path(path) };
+    fs::write(&path, data).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+fn unique_path(path: &Path) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = path.extension().unwrap_or_default().to_string_lossy();
+    let dir = path.parent().unwrap_or(Path::new(""));
+    (1..)
+        .map(|i| dir.join(format!("{stem}-{i}.{ext}")))
+        .find(|p| !p.exists())
+        .expect("infinite iterator")
+}
+
+/// A small preview of a source image for the file list.
+pub struct Thumbnail {
+    /// `size` x `size` BGRA pixels (straight alpha), image centered with transparent padding.
+    pub bgra: Vec<u8>,
+    /// Dimensions of the full image (after applying its orientation).
+    pub width: u32,
+    pub height: u32,
+    pub format: &'static str,
+}
+
+pub fn thumbnail(path: &Path, size: u32) -> Result<Thumbnail> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let format = match image::guess_format(&bytes) {
+        Ok(image::ImageFormat::Jpeg) => "JPEG",
+        Ok(image::ImageFormat::Png) => "PNG",
+        Ok(image::ImageFormat::WebP) => "WebP",
+        Ok(image::ImageFormat::Gif) => "GIF",
+        Ok(image::ImageFormat::Bmp) => "BMP",
+        Ok(image::ImageFormat::Tiff) => "TIFF",
+        Ok(image::ImageFormat::Ico) => "ICO",
+        _ => "Image",
+    };
+    let img = decode(&bytes)?;
+    let (width, height) = (img.width(), img.height());
+    let small = img.thumbnail(size, size).to_rgba8();
+    let (ox, oy) = ((size - small.width()) / 2, (size - small.height()) / 2);
+    let mut bgra = vec![0u8; (size * size * 4) as usize];
+    for (x, y, p) in small.enumerate_pixels() {
+        let i = (((y + oy) * size + x + ox) * 4) as usize;
+        bgra[i..i + 4].copy_from_slice(&[p[2], p[1], p[0], p[3]]);
+    }
+    Ok(Thumbnail { bgra, width, height, format })
+}
+
+fn decode(bytes: &[u8]) -> Result<DynamicImage> {
+    let mut decoder = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()?
+        .into_decoder()
+        .context("unsupported or corrupt image")?;
+    // Outputs drop EXIF, so bake the camera orientation into the pixels.
+    let orientation = decoder.orientation().ok();
+    let mut img = DynamicImage::from_decoder(decoder).context("decoding image")?;
+    if let Some(o) = orientation {
+        img.apply_orientation(o);
+    }
+    Ok(img)
+}
+
+fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>> {
+    // JPEG has no alpha channel: composite transparent pixels onto white.
+    let rgb = if img.color().has_alpha() {
+        let rgba = img.to_rgba8();
+        let mut out = image::RgbImage::new(rgba.width(), rgba.height());
+        for (dst, src) in out.pixels_mut().zip(rgba.pixels()) {
+            let a = src[3] as u32;
+            for c in 0..3 {
+                dst[c] = ((src[c] as u32 * a + 255 * (255 - a) + 127) / 255) as u8;
+            }
+        }
+        out
+    } else {
+        img.to_rgb8()
+    };
+
+    let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
+    comp.set_size(rgb.width() as usize, rgb.height() as usize);
+    comp.set_quality(quality as f32);
+    comp.set_progressive_mode();
+    comp.set_optimize_scans(true);
+    let mut started = comp.start_compress(Vec::new())?;
+    started.write_scanlines(rgb.as_raw())?;
+    Ok(started.finish()?)
+}
+
+fn encode_webp(img: &DynamicImage, quality: u8, lossless: bool) -> Result<Vec<u8>> {
+    let mut config = webp::WebPConfig::new().map_err(|_| anyhow!("invalid WebP config"))?;
+    config.lossless = lossless as i32;
+    config.quality = if lossless { 75.0 } else { quality as f32 };
+    config.method = if lossless { 4 } else { 6 };
+    config.alpha_compression = 1;
+
+    let mem = if img.color().has_alpha() {
+        let rgba = img.to_rgba8();
+        webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height()).encode_advanced(&config)
+    } else {
+        let rgb = img.to_rgb8();
+        webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height()).encode_advanced(&config)
+    }
+    .map_err(|e| anyhow!("WebP encoding failed: {e:?}"))?;
+    Ok(mem.to_vec())
+}
+
+fn encode_avif(img: &DynamicImage, quality: u8, speed: u8) -> Result<Vec<u8>> {
+    let encoder = ravif::Encoder::new()
+        .with_quality(quality as f32)
+        .with_alpha_quality((quality as f32 + 10.0).min(100.0))
+        .with_speed(speed.clamp(1, 10))
+        .with_alpha_color_mode(ravif::AlphaColorMode::UnassociatedClean);
+    let (w, h) = (img.width() as usize, img.height() as usize);
+
+    let encoded = if img.color().has_alpha() {
+        let rgba = img.to_rgba8();
+        let px: Vec<rgb::RGBA8> = rgba
+            .as_raw()
+            .as_chunks::<4>().0.iter()
+            .map(|p| rgb::RGBA8::new(p[0], p[1], p[2], p[3]))
+            .collect();
+        encoder.encode_rgba(imgref::Img::new(&px[..], w, h))
+    } else {
+        let rgb_img = img.to_rgb8();
+        let px: Vec<rgb::RGB8> = rgb_img
+            .as_raw()
+            .as_chunks::<3>().0.iter()
+            .map(|p| rgb::RGB8::new(p[0], p[1], p[2]))
+            .collect();
+        encoder.encode_rgb(imgref::Img::new(&px[..], w, h))
+    }
+    .map_err(|e| anyhow!("AVIF encoding failed: {e}"))?;
+    Ok(encoded.avif_file)
+}
+
+fn encode_png(img: &DynamicImage, original_png: Option<&[u8]>, level: u8) -> Result<Vec<u8>> {
+    let png = match original_png {
+        Some(bytes) => bytes.to_vec(),
+        None => {
+            let mut buf = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
+            buf
+        }
+    };
+    let mut opts = oxipng::Options::from_preset(level.min(6));
+    opts.strip = oxipng::StripChunks::Safe;
+    oxipng::optimize_from_memory(&png, &opts).map_err(|e| anyhow!("PNG optimization failed: {e}"))
+}
+
+/// Extensions we accept as input.
+pub const INPUT_EXTENSIONS: &[&str] = &["jpg", "jpeg", "jfif", "png", "webp", "gif", "bmp", "tif", "tiff", "ico"];
+
+pub fn is_supported(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| INPUT_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+/// Expand dropped files/folders into image sources.
+pub fn collect_sources(paths: &[PathBuf]) -> Result<Vec<Source>> {
+    let mut out = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            let folder_name = p.file_name().map(PathBuf::from).unwrap_or_default();
+            for entry in walkdir::WalkDir::new(p)
+                .follow_links(true)
+                .into_iter()
+                // Never re-process our own output folders.
+                .filter_entry(|e| !(e.file_type().is_dir() && e.file_name() == SUBFOLDER_NAME))
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if entry.file_type().is_file() && is_supported(path) {
+                    let rel_dir = path
+                        .parent()
+                        .and_then(|d| d.strip_prefix(p).ok())
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    out.push(Source {
+                        path: path.to_path_buf(),
+                        default_out_dir: p.join(SUBFOLDER_NAME).join(&rel_dir),
+                        custom_rel_dir: folder_name.join(&rel_dir),
+                    });
+                }
+            }
+        } else if p.is_file() {
+            if !is_supported(p) {
+                continue;
+            }
+            let parent = p.parent().unwrap_or(Path::new("."));
+            out.push(Source {
+                path: p.clone(),
+                default_out_dir: parent.join(SUBFOLDER_NAME),
+                custom_rel_dir: PathBuf::new(),
+            });
+        } else {
+            bail!("{} does not exist", p.display());
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gio-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sample_image(alpha: bool) -> DynamicImage {
+        let (w, h) = (320, 200);
+        if alpha {
+            DynamicImage::ImageRgba8(image::RgbaImage::from_fn(w, h, |x, y| {
+                image::Rgba([(x % 256) as u8, (y % 256) as u8, 128, if x < w / 2 { 255 } else { 64 }])
+            }))
+        } else {
+            DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+                image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+            }))
+        }
+    }
+
+    #[test]
+    fn encodes_every_format_with_and_without_alpha() {
+        for alpha in [false, true] {
+            let img = sample_image(alpha);
+            for (name, data) in [
+                ("jpeg", encode_jpeg(&img, 80).unwrap()),
+                ("webp", encode_webp(&img, 80, false).unwrap()),
+                ("webp-lossless", encode_webp(&img, 80, true).unwrap()),
+                ("avif", encode_avif(&img, 60, 10).unwrap()),
+                ("png", encode_png(&img, None, 1).unwrap()),
+            ] {
+                assert!(data.len() > 20, "{name} alpha={alpha} produced {} bytes", data.len());
+                if name != "avif" {
+                    // Round-trip through the decoder to make sure the output is valid.
+                    let back = image::load_from_memory(&data).unwrap();
+                    assert_eq!((back.width(), back.height()), (320, 200), "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn target_size_by_percent_and_fit() {
+        let pct = |p| Settings { resize: true, resize_mode: ResizeMode::Percent, resize_percent: p, ..Settings::default() };
+        assert_eq!(target_size(4000, 3000, &pct(75)), Some((3000, 2250)));
+        assert_eq!(target_size(4000, 3000, &pct(50)), Some((2000, 1500)));
+        assert_eq!(target_size(4000, 3000, &pct(25)), Some((1000, 750)));
+        assert_eq!(target_size(333, 101, &pct(33)), Some((110, 33)));
+        assert_eq!(target_size(3, 1, &pct(1)), Some((1, 1)), "never collapses to 0 px");
+        assert_eq!(target_size(4000, 3000, &pct(100)), None);
+
+        let fit = |w, h| Settings { resize: true, max_width: w, max_height: h, ..Settings::default() };
+        assert_eq!(target_size(4000, 3000, &fit(1920, 1920)), Some((1920, 1440)));
+        assert_eq!(target_size(3000, 4000, &fit(1920, 0)), Some((1920, 2560)));
+        assert_eq!(target_size(800, 600, &fit(1920, 1920)), None, "never upscales");
+        assert_eq!(target_size(4000, 3000, &fit(0, 0)), None);
+
+        let off = Settings { resize: false, resize_mode: ResizeMode::Percent, ..Settings::default() };
+        assert_eq!(target_size(4000, 3000, &off), None);
+    }
+
+    #[test]
+    fn process_writes_outputs_and_resizes() {
+        let dir = temp_dir("process");
+        let src_path = dir.join("photo.png");
+        sample_image(false).save(&src_path).unwrap();
+
+        let settings = Settings {
+            jpeg: true,
+            webp: true,
+            avif: true,
+            png: true,
+            avif_speed: 10,
+            resize: true,
+            max_width: 160,
+            max_height: 0,
+            skip_if_larger: false,
+            ..Settings::default()
+        };
+        let sources = collect_sources(std::slice::from_ref(&dir)).unwrap();
+        assert_eq!(sources.len(), 1);
+        let results = process(&sources[0], &settings).unwrap();
+        assert_eq!(results.len(), 4);
+        for r in &results {
+            match &r.outcome {
+                Outcome::Written { path, size } => {
+                    assert!(path.starts_with(dir.join(SUBFOLDER_NAME)));
+                    assert_eq!(fs::metadata(path).unwrap().len(), *size);
+                }
+                other => panic!("{:?}: {other:?}", r.format),
+            }
+        }
+        let jpg = image::open(dir.join(SUBFOLDER_NAME).join("photo.jpg")).unwrap();
+        assert_eq!((jpg.width(), jpg.height()), (160, 100));
+
+        // Output folder is skipped when the folder is scanned again.
+        assert_eq!(collect_sources(std::slice::from_ref(&dir)).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
