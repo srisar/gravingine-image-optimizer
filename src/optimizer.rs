@@ -247,36 +247,38 @@ fn write_output(path: &Path, data: &[u8], overwrite: bool) -> Result<PathBuf> {
     }
     // Always create a fresh file (never write through an existing file or symlink at the
     // output path). Overwriting replaces the existing entry; otherwise a number is added.
-    let base = path;
-    let mut path = base.to_path_buf();
     if overwrite
-        && let Ok(meta) = fs::symlink_metadata(&path)
+        && let Ok(meta) = fs::symlink_metadata(path)
         && !meta.is_dir()
     {
-        fs::remove_file(&path).with_context(|| format!("replacing {}", path.display()))?;
+        fs::remove_file(path).with_context(|| format!("replacing {}", path.display()))?;
     }
-    loop {
-        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+    // Try the name itself, then (when not overwriting) "name-1", "name-2", … Each attempt is
+    // the atomic create itself, so anything already there (even a broken link) is skipped.
+    let attempts = if overwrite { 1 } else { MAX_NUMBERED_NAMES };
+    for candidate in std::iter::once(path.to_path_buf()).chain(numbered_paths(path)).take(attempts) {
+        match fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
             Ok(mut file) => {
                 use std::io::Write;
-                file.write_all(data).with_context(|| format!("writing {}", path.display()))?;
-                return Ok(path);
+                file.write_all(data).with_context(|| format!("writing {}", candidate.display()))?;
+                return Ok(candidate);
             }
-            // Taken (or appeared meanwhile): pick the next free numbered name.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && !overwrite => path = unique_path(base),
-            Err(e) => return Err(e).with_context(|| format!("writing {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && !overwrite => continue,
+            Err(e) => return Err(e).with_context(|| format!("writing {}", candidate.display())),
         }
     }
+    bail!("no free file name for {}", path.display())
 }
 
-fn unique_path(path: &Path) -> PathBuf {
+/// How many numbered alternatives ("name-1" … ) to try before giving up.
+const MAX_NUMBERED_NAMES: usize = 10_000;
+
+/// "dir/name-1.ext", "dir/name-2.ext", …
+fn numbered_paths(path: &Path) -> impl Iterator<Item = PathBuf> + '_ {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let ext = path.extension().unwrap_or_default().to_string_lossy();
     let dir = path.parent().unwrap_or(Path::new(""));
-    (1..)
-        .map(|i| dir.join(format!("{stem}-{i}.{ext}")))
-        .find(|p| !p.exists())
-        .expect("infinite iterator")
+    (1..).map(move |i| dir.join(format!("{stem}-{i}.{ext}")))
 }
 
 /// A small preview of a source image for the file list.
@@ -484,6 +486,8 @@ mod tests {
         let second = write_output(&target, b"two", false).unwrap();
         assert_eq!(second, dir.join("out").join("a-1.webp"));
         assert_eq!(fs::read(&target).unwrap(), b"one");
+        // Taken numbered names are skipped too.
+        assert_eq!(write_output(&target, b"two", false).unwrap(), dir.join("out").join("a-2.webp"));
         // Overwriting: the same name, new contents.
         assert_eq!(write_output(&target, b"three", true).unwrap(), target);
         assert_eq!(fs::read(&target).unwrap(), b"three");
