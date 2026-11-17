@@ -3,7 +3,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +17,7 @@ use winapi::shared::windef::HWND;
 
 use crate::optimizer::{self, Format, FormatResult, OutputLocation, Outcome, ResizeMode, Settings, Source};
 use crate::taskbar::{self, Taskbar};
-use crate::{AppWindow, TileData, Ui, winicon};
+use crate::{AppWindow, CompareFormat, TileData, Ui, winicon};
 
 const PERCENT_PRESETS: [u32; 3] = [75, 50, 25];
 /// Thumbnail size in the list (logical pixels).
@@ -45,6 +45,75 @@ struct Job {
     meta: Meta,
     /// Output dimensions of the last run (`None`: kept its size). Set when a run starts.
     run_dims: Option<(u32, u32)>,
+}
+
+/// The open before / after comparison: an image's saved outputs, or a live preview of what
+/// the current settings would produce (encoded in memory, nothing written to disk).
+struct Compare {
+    name: String,
+    original: PathBuf,
+    original_size: u64,
+    /// Original pixel size (upright).
+    width: u32,
+    height: u32,
+    /// Outputs a run saved (empty if the image hasn't been optimized yet).
+    saved: Vec<CompareOutput>,
+    /// Showing the live preview rather than the saved outputs.
+    preview: bool,
+    /// The formats on show: the saved outputs, or those the settings would produce.
+    formats: Vec<Format>,
+    /// Index into `formats`; `None` when none of them can be shown.
+    current: Option<usize>,
+    /// The original, decoded once and shared with the preview encoder.
+    decoded: Option<Arc<optimizer::Decoded>>,
+    /// The original's pixels are on screen.
+    original_shown: bool,
+    /// The request a worker is busy with (one at a time); `dirty` asks for another after it.
+    in_flight: Option<u64>,
+    dirty: bool,
+}
+
+struct CompareOutput {
+    format: Format,
+    path: PathBuf,
+    size: u64,
+}
+
+/// What a comparison worker sends back.
+struct CompareResult {
+    request: u64,
+    original_path: PathBuf,
+    decoded: Result<Arc<optimizer::Decoded>, String>,
+    /// The original's pixels, when they weren't on screen yet.
+    original: Option<PixelBuffer>,
+    /// The output's pixels and file size, unless there was nothing to show.
+    output: Option<Result<(PixelBuffer, u64), String>>,
+}
+
+/// What a comparison worker should produce on the right of the split line.
+enum CompareJob {
+    Nothing,
+    Saved { path: PathBuf, size: u64 },
+    Preview { format: Format, settings: Settings },
+}
+
+type PixelBuffer = SharedPixelBuffer<Rgba8Pixel>;
+
+/// Pixels that can cross threads; the Slint image is made on the UI thread.
+fn pixel_buffer(img: image::RgbaImage) -> PixelBuffer {
+    PixelBuffer::clone_from_slice(img.as_raw(), img.width(), img.height())
+}
+
+/// The outputs a finished image saved, in the order they were written.
+fn compare_outputs(job: &Job) -> Vec<CompareOutput> {
+    let Status::Done(results) = &job.status else { return Vec::new() };
+    results
+        .iter()
+        .filter_map(|r| match &r.outcome {
+            Outcome::Written { path, size } => Some(CompareOutput { format: r.format, path: path.clone(), size: *size }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// What the thumbnail worker found out about an image.
@@ -83,10 +152,14 @@ struct State {
     elapsed: Option<f32>,
     notice: String,
     next_id: u64,
-    /// "To WebP q78 · original size": what the current settings produce, shown on waiting tiles.
+    /// "To WebP at 78% · original size": what the current settings produce, shown on waiting tiles.
     plan: String,
     thumbs: Option<Receiver<ThumbMsg>>,
     thumb_tx: Option<Sender<ThumbMsg>>,
+    /// The before / after comparison, while it's open.
+    compare: Option<Compare>,
+    /// The image just added on its own: its preview opens once it has been read.
+    auto_preview: Option<u64>,
 }
 
 /// Wakes the UI thread from a worker, at most once until the UI thread has handled it.
@@ -122,6 +195,10 @@ pub struct App {
     /// Files dropped on the window, added together once the drop is complete.
     dropped: RefCell<Vec<PathBuf>>,
     drop_flush_queued: Cell<bool>,
+    /// Re-encodes the before / after preview once settings stop changing.
+    preview_timer: slint::Timer,
+    /// Last comparison load started (unique across comparisons).
+    compare_request: Cell<u64>,
     // Never hold a borrow while calling into the UI: callbacks can re-enter the app.
     state: RefCell<State>,
 }
@@ -143,6 +220,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
     slint::BackendSelector::new().backend_name("winit".into()).select()?;
     let ui = AppWindow::new()?;
     ui.global::<Ui>().set_icon_font(winicon::icon_font_face().into());
+    ui.set_app_version(env!("CARGO_PKG_VERSION").into());
+    ui.set_app_build(env!("GIO_BUILD").into());
     match std::env::var("GIO_THEME").as_deref() {
         Ok("dark") => ui.invoke_set_dark(true),
         Ok("light") => ui.invoke_set_dark(false),
@@ -158,6 +237,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
         thumb_waker: Waker::new(App::poll_thumbnails),
         dropped: RefCell::new(Vec::new()),
         drop_flush_queued: Cell::new(false),
+        preview_timer: slint::Timer::default(),
+        compare_request: Cell::new(0),
         state: RefCell::new(State::default()),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
@@ -207,8 +288,15 @@ impl App {
                 }
             })
         });
-        ui.on_settings_changed(|| with_app(App::sync));
+        ui.on_settings_changed(|| with_app(App::on_settings_changed));
         ui.on_tile_toggled(|row, on| with_app(|a| a.set_selected(row as usize, on)));
+        ui.on_compare(|row| with_app(|a| a.open_compare(row as usize)));
+        ui.on_compare_select(|i| with_app(|a| a.select_compare(i as usize)));
+        ui.on_compare_close(|| with_app(App::close_compare));
+        ui.on_compare_mode(|preview| with_app(|a| a.set_compare_mode(preview)));
+        ui.on_open_source(|| open_in_explorer(env!("CARGO_PKG_REPOSITORY")));
+        ui.on_open_releases(|| open_in_explorer(concat!(env!("CARGO_PKG_REPOSITORY"), "/releases")));
+        ui.on_open_website(|| open_in_explorer("https://gravitide.dev"));
         ui.window().on_winit_window_event(|_, event| {
             with_app(|a| a.on_window_event(event));
             EventResult::Propagate
@@ -324,6 +412,11 @@ impl App {
                         }
                     }
                     let new: Vec<(u64, PathBuf)> = st.jobs[before..].iter().map(|j| (j.id, j.source.path.clone())).collect();
+                    // Opening a single image shows its preview right away.
+                    st.auto_preview = match new[..] {
+                        [(id, _)] => Some(id),
+                        _ => None,
+                    };
                     if !new.is_empty() {
                         if st.thumb_tx.is_none() {
                             let (tx, rx) = channel();
@@ -358,6 +451,7 @@ impl App {
             st.elapsed = None;
             st.notice.clear();
         }
+        self.close_compare();
         self.refresh_rows();
     }
 
@@ -418,6 +512,26 @@ impl App {
             }
         }
         self.update_rows(&changed);
+
+        // A single image was added: show its preview as soon as it has been read.
+        let open = {
+            let mut st = self.state.borrow_mut();
+            match st.auto_preview.and_then(|id| st.jobs.iter().position(|j| j.id == id)) {
+                Some(row) if !matches!(st.jobs[row].meta, Meta::Loading) => {
+                    st.auto_preview = None;
+                    let readable = matches!(st.jobs[row].meta, Meta::Read { .. });
+                    (readable && st.run.is_none()).then_some(row)
+                }
+                Some(_) => None, // still loading
+                None => {
+                    st.auto_preview = None; // cleared from the list meanwhile
+                    None
+                }
+            }
+        };
+        if let Some(row) = open {
+            self.open_compare(row);
+        }
     }
 
     fn start(&self) {
@@ -464,6 +578,8 @@ impl App {
             }
             None => {
                 save_settings(&settings);
+                // The run rewrites the outputs being compared.
+                self.close_compare();
                 self.taskbar_progress(0, 1);
                 self.refresh_rows();
                 #[cfg(any(debug_assertions, feature = "snapshot"))]
@@ -534,6 +650,270 @@ impl App {
         }
         if let Some(t) = taskbar.as_ref() {
             t.progress(done, total);
+        }
+    }
+
+    // -------------------------------------------------------------- before / after
+
+    /// Open the comparison for an image: its saved outputs if it has any that can be shown,
+    /// otherwise a live preview of the current settings.
+    fn open_compare(&self, row: usize) {
+        let compare = {
+            let st = self.state.borrow();
+            let Some(job) = st.jobs.get(row) else { return };
+            let Meta::Read { width, height, .. } = job.meta else { return };
+            let saved = compare_outputs(job);
+            Compare {
+                name: job.file_name.clone(),
+                original: job.source.path.clone(),
+                original_size: job.original_size,
+                width,
+                height,
+                preview: !saved.iter().any(|o| optimizer::can_preview(o.format)),
+                saved,
+                formats: Vec::new(),
+                current: None,
+                decoded: None,
+                original_shown: false,
+                in_flight: None,
+                dirty: false,
+            }
+        };
+        let ui = &self.ui;
+        ui.set_compare_name(compare.name.as_str().into());
+        ui.set_compare_width(compare.width as i32);
+        ui.set_compare_height(compare.height as i32);
+        ui.set_compare_original_size(human_size(compare.original_size).into());
+        ui.set_compare_original_dims(format!("{} × {}", compare.width, compare.height).into());
+        ui.set_compare_has_saved(compare.saved.iter().any(|o| optimizer::can_preview(o.format)));
+        ui.set_compare_original(Image::default());
+        ui.set_compare_output(Image::default());
+        ui.set_compare_output_label("".into());
+        self.clear_compare_output_figures();
+        ui.set_compare_zoom(0.0);
+        ui.set_compare_split(0.5);
+        self.state.borrow_mut().compare = Some(compare);
+        ui.set_compare_open(true);
+        self.refresh_compare();
+    }
+
+    /// Blank the output side of the comparison footer.
+    fn clear_compare_output_figures(&self) {
+        let ui = &self.ui;
+        ui.set_compare_output_caption("".into());
+        ui.set_compare_output_size("".into());
+        ui.set_compare_output_dims("".into());
+        ui.set_compare_saving("".into());
+        ui.set_compare_saving_detail("".into());
+        ui.set_compare_output_tone(0);
+    }
+
+    /// Switch between the saved outputs and the live preview.
+    fn set_compare_mode(&self, preview: bool) {
+        match self.state.borrow_mut().compare.as_mut() {
+            Some(c) if c.preview != preview => c.preview = preview,
+            _ => return,
+        }
+        self.refresh_compare();
+    }
+
+    fn select_compare(&self, index: usize) {
+        {
+            let mut st = self.state.borrow_mut();
+            let Some(c) = st.compare.as_mut() else { return };
+            let Some(&format) = c.formats.get(index) else { return };
+            if c.current == Some(index) || !optimizer::can_preview(format) {
+                return;
+            }
+            c.current = Some(index);
+        }
+        self.ui.set_compare_current(index as i32);
+        self.load_compare();
+    }
+
+    /// Settings changed: re-encode the preview once they settle (sliders send many changes).
+    fn on_settings_changed(&self) {
+        self.sync();
+        if self.state.borrow().compare.as_ref().is_some_and(|c| c.preview) {
+            self.preview_timer.start(slint::TimerMode::SingleShot, Duration::from_millis(250), || {
+                with_app(App::refresh_compare)
+            });
+        }
+    }
+
+    /// Rebuild the format chips for the mode and settings, keeping the chosen format when it's
+    /// still there, then load what's chosen.
+    fn refresh_compare(&self) {
+        let settings = self.read_settings();
+        let (chips, current, preview) = {
+            let mut st = self.state.borrow_mut();
+            let Some(c) = st.compare.as_mut() else { return };
+            let previous = c.current.and_then(|i| c.formats.get(i).copied());
+            c.formats = if c.preview { settings.formats() } else { c.saved.iter().map(|o| o.format).collect() };
+            let shown = |f: &Format| optimizer::can_preview(*f);
+            c.current = previous
+                .and_then(|p| c.formats.iter().position(|f| *f == p && shown(f)))
+                .or_else(|| c.formats.iter().position(shown));
+            let chips: Vec<CompareFormat> = c
+                .formats
+                .iter()
+                .map(|&format| CompareFormat {
+                    label: format.label().into(),
+                    detail: match (c.preview, c.saved.iter().find(|o| o.format == format)) {
+                        (false, Some(o)) => human_size(o.size).into(),
+                        _ => "".into(),
+                    },
+                    available: optimizer::can_preview(format),
+                })
+                .collect();
+            (chips, c.current, c.preview)
+        };
+        let ui = &self.ui;
+        ui.set_compare_formats(ModelRc::new(VecModel::from(chips)));
+        ui.set_compare_current(current.map_or(-1, |i| i as i32));
+        ui.set_compare_preview(preview);
+        self.load_compare();
+    }
+
+    fn close_compare(&self) {
+        if self.state.borrow_mut().compare.take().is_none() {
+            return;
+        }
+        self.preview_timer.stop();
+        let ui = &self.ui;
+        ui.set_compare_open(false);
+        // Free the full-size pictures.
+        ui.set_compare_original(Image::default());
+        ui.set_compare_output(Image::default());
+    }
+
+    /// Decode the original (once) and produce the chosen output on a worker thread: read the
+    /// saved file, or encode a preview in memory. One worker at a time per comparison.
+    fn load_compare(&self) {
+        let settings = self.read_settings();
+        let request = self.compare_request.get() + 1;
+        let (path, decoded, need_original, job, busy) = {
+            let mut st = self.state.borrow_mut();
+            let Some(c) = st.compare.as_mut() else { return };
+            if c.in_flight.is_some() {
+                c.dirty = true;
+                return;
+            }
+            c.in_flight = Some(request);
+            c.dirty = false;
+            let job = match c.current.map(|i| c.formats[i]) {
+                None => CompareJob::Nothing,
+                Some(format) if c.preview => CompareJob::Preview { format, settings },
+                Some(format) => match c.saved.iter().find(|o| o.format == format) {
+                    Some(o) => CompareJob::Saved { path: o.path.clone(), size: o.size },
+                    None => CompareJob::Nothing,
+                },
+            };
+            let busy = if !c.original_shown {
+                "Loading…"
+            } else if matches!(job, CompareJob::Preview { .. }) {
+                "Updating preview…"
+            } else {
+                "Loading…"
+            };
+            (c.original.clone(), c.decoded.clone(), !c.original_shown, job, busy)
+        };
+        self.compare_request.set(request);
+        let ui = &self.ui;
+        ui.set_compare_busy(if matches!(job, CompareJob::Nothing) && !need_original { "".into() } else { busy.into() });
+        std::thread::spawn(move || {
+            let text = |e: anyhow::Error| format!("{e:#}");
+            let decoded = match decoded {
+                Some(d) => Ok(d),
+                None => optimizer::Decoded::open(&path).map(Arc::new).map_err(text),
+            };
+            let original = if need_original { decoded.as_ref().ok().map(|d| pixel_buffer(d.rgba())) } else { None };
+            let output = match job {
+                CompareJob::Nothing => None,
+                CompareJob::Saved { path, size } => {
+                    Some(optimizer::load_rgba(&path).map(|p| (pixel_buffer(p), size)).map_err(text))
+                }
+                CompareJob::Preview { format, settings } => Some(match &decoded {
+                    Ok(d) => optimizer::preview(d, format, &settings).map(|(size, p)| (pixel_buffer(p), size)).map_err(text),
+                    Err(e) => Err(e.clone()),
+                }),
+            };
+            let result = CompareResult { request, original_path: path, decoded, original, output };
+            let _ = slint::invoke_from_event_loop(move || with_app(|a| a.compare_loaded(result)));
+        });
+    }
+
+    fn compare_loaded(&self, result: CompareResult) {
+        let settings = self.read_settings();
+        let (label, original_size, preview, again) = {
+            let mut st = self.state.borrow_mut();
+            // Closed, or another image opened since.
+            let Some(c) = st.compare.as_mut().filter(|c| c.original == result.original_path) else { return };
+            if c.in_flight == Some(result.request) {
+                c.in_flight = None;
+            }
+            if let Ok(d) = &result.decoded {
+                c.decoded.get_or_insert_with(|| d.clone());
+            }
+            let format = c.current.map(|i| c.formats[i]);
+            let label = match format {
+                Some(f) if c.preview => format_setting(f, &settings),
+                Some(f) => f.label().to_string(),
+                None => String::new(),
+            };
+            (label, c.original_size, c.preview, c.dirty)
+        };
+        let ui = &self.ui;
+        let mut problem = None;
+        if let Some(buffer) = result.original {
+            ui.set_compare_original(Image::from_rgba8(buffer));
+            if let Some(c) = self.state.borrow_mut().compare.as_mut() {
+                c.original_shown = true;
+            }
+        } else if let Err(e) = &result.decoded {
+            problem = Some(format!("Couldn't open the original: {e}"));
+        }
+        match result.output {
+            Some(Ok((buffer, size))) => {
+                let larger = size >= original_size;
+                let pct = savings_pct(original_size, size).abs().round();
+                let (saving, detail) = if larger {
+                    let detail = if preview && settings.skip_if_larger {
+                        "would be skipped".to_string()
+                    } else {
+                        format!("{} larger", human_size(size - original_size))
+                    };
+                    (format!("+{pct:.0}%"), detail)
+                } else {
+                    (format!("\u{2212}{pct:.0}%"), format!("saves {}", human_size(original_size - size)))
+                };
+                let caption = if preview { format!("{label} · not saved yet") } else { format!("{label} · saved") };
+                ui.set_compare_output_caption(caption.into());
+                ui.set_compare_output_size(human_size(size).into());
+                ui.set_compare_output_dims(format!("{} × {}", buffer.width(), buffer.height()).into());
+                ui.set_compare_saving(saving.into());
+                ui.set_compare_saving_detail(detail.into());
+                ui.set_compare_output_tone(if larger { 2 } else { 1 });
+                ui.set_compare_output_label(if preview { format!("Preview: {label}") } else { label }.into());
+                ui.set_compare_output(Image::from_rgba8(buffer));
+            }
+            Some(Err(e)) => problem = problem.or(Some(format!("Couldn't show the {label} output: {e}"))),
+            None => {
+                ui.set_compare_output(Image::default());
+                ui.set_compare_output_label("".into());
+                self.clear_compare_output_figures();
+                problem = problem.or(Some(if preview {
+                    "Turn on WebP, JPEG or PNG to preview (AVIF previews aren't supported yet)".into()
+                } else {
+                    "None of the saved outputs can be shown".into()
+                }));
+            }
+        }
+        ui.set_compare_message(problem.unwrap_or_default().into());
+        ui.set_compare_busy("".into());
+        if again {
+            // Settings or the choice changed while this was being made.
+            self.load_compare();
         }
     }
 
@@ -840,6 +1220,8 @@ fn tile_view(job: &Job, plan: &str, settings: &Settings) -> TileData {
         selected: job.selected,
         thumb: job.thumb.clone().unwrap_or_default(),
         has_thumb: job.thumb.is_some(),
+        // Any readable image: a preview before optimizing, the saved outputs after.
+        can_compare: matches!(job.meta, Meta::Read { .. }),
         orig_dims: orig_dims.into(),
         orig_size: human_size(job.original_size).into(),
         out_resized: out_dims.is_some(),
@@ -864,25 +1246,26 @@ fn result_text(results: &[FormatResult], original: u64) -> String {
         .join(" · ")
 }
 
-/// "To WebP q78, AVIF q65 · 50%": what the current settings will produce.
+/// "WebP at 80%", "PNG lossless": a format with its main setting (quality as a percentage).
+fn format_setting(format: Format, s: &Settings) -> String {
+    match format {
+        Format::Jpeg => format!("JPEG at {}%", s.jpeg_quality),
+        Format::WebP if s.webp_lossless => "WebP lossless".into(),
+        Format::WebP => format!("WebP at {}%", s.webp_quality),
+        Format::Avif => format!("AVIF at {}%", s.avif_quality),
+        Format::Png => "PNG lossless".into(),
+    }
+}
+
+/// "To WebP at 78%, AVIF at 65% · resized to 50%": what the current settings will produce.
 fn plan_text(s: &Settings) -> String {
-    let formats: Vec<String> = s
-        .formats()
-        .into_iter()
-        .map(|f| match f {
-            Format::Jpeg => format!("JPEG q{}", s.jpeg_quality),
-            Format::WebP if s.webp_lossless => "WebP lossless".into(),
-            Format::WebP => format!("WebP q{}", s.webp_quality),
-            Format::Avif => format!("AVIF q{}", s.avif_quality),
-            Format::Png => "PNG lossless".into(),
-        })
-        .collect();
+    let formats: Vec<String> = s.formats().into_iter().map(|f| format_setting(f, s)).collect();
     if formats.is_empty() {
         return "No output format selected".into();
     }
     let size = match (s.resize, s.resize_mode) {
         (false, _) => "original size".to_string(),
-        (true, ResizeMode::Percent) => format!("{}%", s.resize_percent),
+        (true, ResizeMode::Percent) => format!("resized to {}%", s.resize_percent),
         (true, ResizeMode::FitWithin) => {
             let side = |v: u32| if v == 0 { "any".to_string() } else { v.to_string() };
             format!("fit {} × {}", side(s.max_width), side(s.max_height))
@@ -984,14 +1367,18 @@ fn human_size(bytes: u64) -> String {
     if unit == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[unit]) }
 }
 
-fn open_in_explorer(dir: &Path) {
-    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+/// Open a folder in Explorer, or a web address in the default browser.
+fn open_in_explorer(target: impl AsRef<std::ffi::OsStr>) {
+    let _ = std::process::Command::new("explorer").arg(target).spawn();
 }
 
 /// Debug self-check: with `GIO_SNAPSHOT=<file.png>` the app renders its own window to a PNG
 /// and exits.
 /// - `GIO_SNAPSHOT_RUN=1` optimizes the loaded files first (`GIO_SNAPSHOT_MIDRUN=<ms>`
 ///   captures that long after the run starts instead of at the end);
+/// - `GIO_SNAPSHOT_COMPARE=<row>` (with `GIO_SNAPSHOT_RUN`) opens the before / after view for
+///   that row once the run is done; `GIO_SNAPSHOT_ZOOM=50` shows it at 50% (default Fit),
+///   `GIO_SNAPSHOT_SPLIT=0.3` moves the split line;
 /// - `GIO_SNAPSHOT_ALL_ON=1` switches every format and resizing on first;
 /// - `GIO_THEME=dark|light` forces a theme.
 #[cfg(any(debug_assertions, feature = "snapshot"))]
@@ -1006,6 +1393,12 @@ mod snapshot {
         if var("GIO_SNAPSHOT").is_none() {
             return;
         }
+        if var("GIO_SNAPSHOT_ABOUT").is_some() {
+            with_app(|a| {
+                a.ui.set_about_open(true);
+                a.ui.set_about_licenses(var("GIO_SNAPSHOT_ABOUT").as_deref() == Some("licenses"));
+            });
+        }
         if var("GIO_SNAPSHOT_ALL_ON").is_some() {
             with_app(|a| {
                 let ui = &a.ui;
@@ -1019,7 +1412,7 @@ mod snapshot {
         slint::Timer::single_shot(Duration::from_millis(1500), || {
             if var("GIO_SNAPSHOT_RUN").is_some() {
                 with_app(App::start);
-            } else {
+            } else if !compare_then_capture() {
                 capture();
             }
         });
@@ -1032,10 +1425,43 @@ mod snapshot {
     }
 
     pub fn on_run_finished() {
-        if var("GIO_SNAPSHOT").is_some() && var("GIO_SNAPSHOT_MIDRUN").is_none() {
+        if var("GIO_SNAPSHOT").is_none() || var("GIO_SNAPSHOT_MIDRUN").is_some() {
+            return;
+        }
+        if !compare_then_capture() {
             // Let the final state render first.
             slint::Timer::single_shot(Duration::from_millis(400), capture);
         }
+    }
+
+    /// With `GIO_SNAPSHOT_COMPARE=<row>`: open the before / after view, optionally retune the
+    /// preview (`GIO_SNAPSHOT_RETUNE=<WebP and JPEG quality>`), then capture. Returns whether
+    /// it did.
+    fn compare_then_capture() -> bool {
+        let Some(row) = var("GIO_SNAPSHOT_COMPARE").and_then(|v| v.parse::<usize>().ok()) else { return false };
+        with_app(|a| {
+            a.open_compare(row);
+            let zoom = var("GIO_SNAPSHOT_ZOOM").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+            a.ui.set_compare_zoom(zoom / 100.0);
+            if let Some(split) = var("GIO_SNAPSHOT_SPLIT").and_then(|v| v.parse::<f32>().ok()) {
+                a.ui.set_compare_split(split);
+            }
+        });
+        let retune = var("GIO_SNAPSHOT_RETUNE").and_then(|v| v.parse::<f32>().ok());
+        if let Some(quality) = retune {
+            // Change settings while the preview is open, as moving a slider would.
+            slint::Timer::single_shot(Duration::from_millis(1500), move || {
+                with_app(|a| {
+                    a.ui.set_webp_quality(quality);
+                    a.ui.set_jpeg_quality(quality);
+                    a.on_settings_changed();
+                })
+            });
+        }
+        // Decoding and encoding full-size images takes a moment.
+        let wait = if retune.is_some() { 4000 } else { 2000 };
+        slint::Timer::single_shot(Duration::from_millis(wait), capture);
+        true
     }
 
     fn capture() {
