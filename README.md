@@ -49,6 +49,30 @@ The binary is at `target/release/gravingine_image_optimizer.exe`.
 cargo test     # encoder + pipeline tests
 ```
 
+## Releases
+
+`scripts/build-release.sh` runs the tests, builds the optimized binary and packages it (Git Bash):
+
+```bash
+scripts/build-release.sh   # add --skip-tests to only build and package
+```
+
+It writes `dist/gravingine-image-optimizer-v<version>-windows-x64.zip` (the exe and this README)
+and a `.sha256` checksum next to it.
+
+To publish a release on GitHub, bump `version` in `Cargo.toml`, merge that, then push a matching
+tag from `main`:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The *Release* workflow (`.github/workflows/release.yml`) then checks the tag against
+`Cargo.toml`, runs the same script on a Windows runner, and publishes a GitHub release with the zip,
+its checksum and notes generated from the merged pull requests. The exe isn't code-signed, so
+Windows SmartScreen may warn on first launch.
+
 ## Project layout
 
 - `ui/app.slint` – the whole window: settings cards, file list tiles, toolbar and footer (compiled by `build.rs` with the Cosmic style)
