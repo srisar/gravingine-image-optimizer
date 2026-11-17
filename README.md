@@ -15,9 +15,10 @@ smaller files.
   | WebP | libwebp (lossy or lossless) | Supports transparency |
   | AVIF | ravif / rav1e | Smallest files, slower to encode |
   | PNG  | oxipng (lossless) | Re-compresses PNGs in place when not resized |
-- **Resize** to fit a maximum width/height, or scale to 75%, 50%, 25% or a custom percentage (aspect ratio kept, never upscales).
+- **Resize** with presets: Thumbnails (230 × 230), Small (640 × 480), Medium (800 × 600), Large (1024 × 768), HD (1920 × 1080) and 4K (3840 × 2160), which fit the image within the size turned to its orientation (a portrait photo fits 480 × 640 for Small); or reduce to 25%, 50% or 75%; or a custom maximum width/height or percentage. The aspect ratio is kept and images are never enlarged.
 - Strips metadata (EXIF/GPS) and bakes in EXIF orientation.
 - *Skip outputs larger than the original* so you never end up with a worse file.
+- *Clear images from the list once optimized* (under *Save to*): after a run, images that optimized cleanly leave the list and their savings go into the status line; images with errors stay, so you can read why.
 - File list as tiles: thumbnail with a status badge, file name and format, what will be produced (or the colored result) and where it was saved, with a progress bar while optimizing. On the right, *Original* and *Output* columns: dimensions and file size before, and the resized dimensions and smallest saved size after. Tick the images to process with their checkboxes; *Select all* / *Select none*.
 - **Before / after preview**: adding a single image opens it straight away; otherwise clicking a tile (or its eye button) opens the original and an output side by side with a split line you drag across, both drawn at the same size so quality is what you compare. Before optimizing, it's a live preview: the current settings are encoded in memory (nothing is saved), and moving a slider or switching a format re-encodes it, so you can tune by eye and then click *Optimize*. Optimized images can switch between *Saved* (the files written) and *Preview*. Choose the format and the zoom (*Fit*, 25%, 50%, 75% or 100%; drag to pan when the picture is bigger than the view); Esc closes it. AVIF can't be previewed yet (no AVIF decoder built in).
 - Parallel processing on all CPU cores, cancellable, with per-file and total savings, progress on the taskbar button, and a taskbar flash when a run finishes in the background.
@@ -116,6 +117,8 @@ GIO_SNAPSHOT=window.png cargo run -- "D:\Photos"
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 cargo run -- "D:\Photos"   # optimize first, then capture
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_MIDRUN=300 cargo run -- "D:\Photos"   # capture while optimizing
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_ALL_ON=1 cargo run   # switch every format and resizing on first
+GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RESIZE=2 cargo run -- "D:\Photos"   # resizing on, with the 3rd resize choice (Medium)
+GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_CLEAR=1 cargo run -- "D:\Photos"   # optimize with "Clear images ... once optimized" on
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_COMPARE=0 cargo run -- "D:\Photos"   # run, then open the comparison for the first image
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_COMPARE=0 GIO_SNAPSHOT_ZOOM=100 GIO_SNAPSHOT_SPLIT=0.3 cargo run -- "D:\Photos"   # ...at 100% (or 25, 50, 75), line at 30%
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_COMPARE=0 cargo run -- "D:\Photos"   # live preview of the first image, nothing optimized

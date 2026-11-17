@@ -59,6 +59,9 @@ pub enum ResizeMode {
     FitWithin,
     /// Scale both sides by `resize_percent`.
     Percent,
+    /// Shrink to fit within the `box_width` x `box_height` preset, turned to match the
+    /// image's orientation (a portrait photo fits 480 x 640 for a 640 x 480 box).
+    Box,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -84,11 +87,16 @@ pub struct Settings {
     pub max_height: u32,
     /// 1 ..= 100, used by `ResizeMode::Percent`.
     pub resize_percent: u32,
+    /// The size preset used by `ResizeMode::Box` (kept apart from the custom `max_*`).
+    pub box_width: u32,
+    pub box_height: u32,
 
     pub output: OutputLocation,
     /// Don't write an output that is not smaller than the original file.
     pub skip_if_larger: bool,
     pub overwrite: bool,
+    /// Remove images from the list once they have been optimized (the app's list, not files).
+    pub clear_when_done: bool,
 }
 
 impl Default for Settings {
@@ -109,9 +117,12 @@ impl Default for Settings {
             max_width: 1920,
             max_height: 1920,
             resize_percent: 50,
+            box_width: 1920,
+            box_height: 1080,
             output: OutputLocation::Subfolder,
             skip_if_larger: true,
             overwrite: true,
+            clear_when_done: false,
         }
     }
 }
@@ -169,12 +180,16 @@ pub fn target_size(w: u32, h: u32, settings: &Settings) -> Option<(u32, u32)> {
     if !settings.resize || w == 0 || h == 0 {
         return None;
     }
+    let limit = |max: u32, side: u32| if max == 0 { 1.0 } else { max as f64 / side as f64 };
     let scale = match settings.resize_mode {
-        ResizeMode::FitWithin => {
-            let limit = |max: u32, side: u32| if max == 0 { 1.0 } else { max as f64 / side as f64 };
-            limit(settings.max_width, w).min(limit(settings.max_height, h))
-        }
+        ResizeMode::FitWithin => limit(settings.max_width, w).min(limit(settings.max_height, h)),
         ResizeMode::Percent => settings.resize_percent.clamp(1, 100) as f64 / 100.0,
+        ResizeMode::Box => {
+            // Turn the box to match the image: a portrait photo fits 480 x 640 for 640 x 480.
+            let (bw, bh) = (settings.box_width, settings.box_height);
+            let (bw, bh) = if (h > w) != (bh > bw) && h != w { (bh, bw) } else { (bw, bh) };
+            limit(bw, w).min(limit(bh, h))
+        }
     };
     if scale >= 1.0 {
         return None;
@@ -608,6 +623,15 @@ mod tests {
         assert_eq!(target_size(3000, 4000, &fit(1920, 0)), Some((1920, 2560)));
         assert_eq!(target_size(800, 600, &fit(1920, 1920)), None, "never upscales");
         assert_eq!(target_size(4000, 3000, &fit(0, 0)), None);
+
+        let preset = |w, h| Settings { resize: true, resize_mode: ResizeMode::Box, box_width: w, box_height: h, ..Settings::default() };
+        assert_eq!(target_size(4000, 3000, &preset(640, 480)), Some((640, 480)));
+        assert_eq!(target_size(3000, 4000, &preset(640, 480)), Some((480, 640)), "turned for portrait");
+        assert_eq!(target_size(1920, 1080, &preset(800, 600)), Some((800, 450)));
+        assert_eq!(target_size(1080, 1920, &preset(800, 600)), Some((450, 800)));
+        assert_eq!(target_size(1000, 1000, &preset(640, 480)), Some((480, 480)), "square fits the short side");
+        assert_eq!(target_size(3000, 2000, &preset(230, 230)), Some((230, 153)));
+        assert_eq!(target_size(600, 400, &preset(1920, 1080)), None, "never upscales");
 
         let off = Settings { resize: false, resize_mode: ResizeMode::Percent, ..Settings::default() };
         assert_eq!(target_size(4000, 3000, &off), None);
