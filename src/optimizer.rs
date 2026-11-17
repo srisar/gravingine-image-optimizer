@@ -393,11 +393,35 @@ fn is_avif(bytes: &[u8]) -> bool {
     bytes.get(4..12).is_some_and(|b| b == b"ftypavif" || b == b"ftypavis")
 }
 
+/// The most memory one decoded image may take (RGBA, 16-bit worst case): the image crate's
+/// default allocation limit, applied to AVIF too.
+const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The largest width x height declared in the file's `ispe` (image spatial extents) boxes.
+/// Box layout: size, "ispe", version/flags, width, height (all 32-bit big-endian).
+fn avif_declared_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let be = |at: usize| bytes.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"ispe")
+        .filter_map(|(at, _)| Some((be(at + 8)?, be(at + 12)?)))
+        .max_by_key(|&(w, h)| w as u64 * h as u64)
+}
+
 /// Decode an AVIF file to 8-bit RGBA.
 fn decode_avif(bytes: &[u8]) -> Result<image::RgbaImage> {
     use avif_decode::Image;
-    let image = avif_decode::Decoder::from_avif(bytes)
-        .and_then(|d| d.to_image())
+    // Refuse images too large to decode before the decoder allocates for them.
+    match avif_declared_size(bytes) {
+        Some((w, h)) if w as u64 * h as u64 * 8 > MAX_DECODED_BYTES => {
+            bail!("AVIF image is too large to decode ({w} × {h})")
+        }
+        Some(_) => {}
+        None => bail!("decoding AVIF: no image size in the file"),
+    }
+    let image = catch_unwind(AssertUnwindSafe(|| avif_decode::Decoder::from_avif(bytes).and_then(|d| d.to_image())))
+        .map_err(|_| anyhow!("decoding AVIF: the decoder crashed"))?
         .map_err(|e| anyhow!("decoding AVIF: {e}"))?;
     // 16-bit samples use the full 0..=65535 range.
     let wide = |v: u16| (v >> 8) as u8;
@@ -589,6 +613,20 @@ mod tests {
             let mean = diff as f64 / original.as_raw().len() as f64;
             assert!(mean < 6.0, "alpha={alpha}: mean difference {mean:.2}");
         }
+    }
+
+    #[test]
+    fn avif_claiming_a_huge_size_is_refused_before_decoding() {
+        let mut avif = encode_avif(&sample_image(false), 60, 10).unwrap();
+        assert_eq!(avif_declared_size(&avif), Some((320, 200)));
+        // Rewrite every ispe box to claim 100 000 x 100 000 pixels.
+        let at: Vec<usize> = avif.windows(4).enumerate().filter(|(_, w)| *w == b"ispe").map(|(i, _)| i).collect();
+        for i in at {
+            avif[i + 8..i + 12].copy_from_slice(&100_000u32.to_be_bytes());
+            avif[i + 12..i + 16].copy_from_slice(&100_000u32.to_be_bytes());
+        }
+        let err = decode(&avif).unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
     }
 
     #[test]
