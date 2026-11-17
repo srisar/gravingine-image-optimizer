@@ -717,7 +717,7 @@ impl App {
                 original_size: job.original_size,
                 width,
                 height,
-                preview: !saved.iter().any(|o| optimizer::can_preview(o.format)),
+                preview: saved.is_empty(),
                 saved,
                 formats: Vec::new(),
                 current: None,
@@ -733,7 +733,7 @@ impl App {
         ui.set_compare_height(compare.height as i32);
         ui.set_compare_original_size(human_size(compare.original_size).into());
         ui.set_compare_original_dims(format!("{} × {}", compare.width, compare.height).into());
-        ui.set_compare_has_saved(compare.saved.iter().any(|o| optimizer::can_preview(o.format)));
+        ui.set_compare_has_saved(!compare.saved.is_empty());
         ui.set_compare_original(Image::default());
         ui.set_compare_output(Image::default());
         ui.set_compare_output_label("".into());
@@ -769,8 +769,7 @@ impl App {
         {
             let mut st = self.state.borrow_mut();
             let Some(c) = st.compare.as_mut() else { return };
-            let Some(&format) = c.formats.get(index) else { return };
-            if c.current == Some(index) || !optimizer::can_preview(format) {
+            if c.current == Some(index) || index >= c.formats.len() {
                 return;
             }
             c.current = Some(index);
@@ -798,10 +797,9 @@ impl App {
             let Some(c) = st.compare.as_mut() else { return };
             let previous = c.current.and_then(|i| c.formats.get(i).copied());
             c.formats = if c.preview { settings.formats() } else { c.saved.iter().map(|o| o.format).collect() };
-            let shown = |f: &Format| optimizer::can_preview(*f);
             c.current = previous
-                .and_then(|p| c.formats.iter().position(|f| *f == p && shown(f)))
-                .or_else(|| c.formats.iter().position(shown));
+                .and_then(|p| c.formats.iter().position(|f| *f == p))
+                .or((!c.formats.is_empty()).then_some(0));
             let chips: Vec<CompareFormat> = c
                 .formats
                 .iter()
@@ -811,7 +809,6 @@ impl App {
                         (false, Some(o)) => human_size(o.size).into(),
                         _ => "".into(),
                     },
-                    available: optimizer::can_preview(format),
                 })
                 .collect();
             (chips, c.current, c.preview)
@@ -951,7 +948,7 @@ impl App {
                 ui.set_compare_output_label("".into());
                 self.clear_compare_output_figures();
                 problem = problem.or(Some(if preview {
-                    "Turn on WebP, JPEG or PNG to preview (AVIF previews aren't supported yet)".into()
+                    "Turn on an output format to preview".into()
                 } else {
                     "None of the saved outputs can be shown".into()
                 }));
@@ -1564,6 +1561,10 @@ mod snapshot {
         let Some(row) = var("GIO_SNAPSHOT_COMPARE").and_then(|v| v.parse::<usize>().ok()) else { return false };
         with_app(|a| {
             a.open_compare(row);
+            // GIO_SNAPSHOT_COMPARE_FORMAT=<n>: the n-th format chip (e.g. 2 = AVIF with every format on).
+            if let Some(chip) = var("GIO_SNAPSHOT_COMPARE_FORMAT").and_then(|v| v.parse::<usize>().ok()) {
+                a.select_compare(chip);
+            }
             let zoom = var("GIO_SNAPSHOT_ZOOM").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
             a.ui.set_compare_zoom(zoom / 100.0);
             if let Some(split) = var("GIO_SNAPSHOT_SPLIT").and_then(|v| v.parse::<f32>().ok()) {

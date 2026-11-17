@@ -7,6 +7,7 @@ repository = "https://github.com/srisar/gravingine-image-optimizer"
 
 [dependencies]
 anyhow = "1.0.104"
+avif-decode = { version = "3.0.0", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff", "ico"] }
 imgref = "1.12.3"
 mozjpeg = "0.10.13"

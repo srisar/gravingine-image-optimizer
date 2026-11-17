@@ -77,7 +77,6 @@ export struct TileData {
 export struct CompareFormat {
     label: string,
     detail: string,
-    available: bool,
 }
 
 component Icon inherits Text {
@@ -682,7 +681,6 @@ component CompareView inherits Rectangle {
             for format[i] in root.formats: Chip {
                 text: format.detail == "" ? format.label : format.label + " " + format.detail;
                 on: i == root.current;
-                enabled: format.available;
                 clicked => { root.select(i); }
             }
         }
@@ -962,6 +960,7 @@ component AboutDialog inherits Rectangle {
         { name: "mozjpeg", detail: "JPEG encoder · IJG, BSD-3-Clause and zlib licenses" },
         { name: "libwebp", detail: "WebP encoder · BSD-3-Clause" },
         { name: "rav1e, ravif", detail: "AVIF encoder · BSD-2-Clause, BSD-3-Clause" },
+        { name: "rav1d, avif-decode", detail: "AVIF decoder for previews · BSD-2-Clause, BSD-3-Clause; avif-parse · MPL-2.0" },
         { name: "oxipng", detail: "PNG optimizer · MIT" },
         { name: "image", detail: "Image decoding · MIT or Apache-2.0" },
         { name: "Rust crates", detail: "rayon, rfd, serde, walkdir and others · MIT, Apache-2.0 or similar permissive licenses" },
