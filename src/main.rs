@@ -3,6 +3,7 @@
 slint::include_modules!();
 
 mod app;
+mod logo;
 mod optimizer;
 mod taskbar;
 mod winicon;

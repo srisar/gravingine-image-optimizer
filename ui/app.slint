@@ -2,7 +2,7 @@
 // Colors come from the style's Palette (which follows Windows' light/dark mode and tints its
 // accent from the Windows accent color); icons are glyphs from the Windows icon font.
 
-import { CheckBox, ComboBox, LineEdit, ListView, Palette, ProgressIndicator, ScrollView, Slider, Switch } from "std-widgets.slint";
+import { AboutSlint, CheckBox, ComboBox, LineEdit, ListView, Palette, ProgressIndicator, ScrollView, Slider, Switch } from "std-widgets.slint";
 
 export global Ui {
     // "Segoe Fluent Icons" on Windows 11, "Segoe MDL2 Assets" on Windows 10 (set from Rust).
@@ -41,6 +41,11 @@ export global Glyph {
     out property <string> png: "\u{E790}";
     out property <string> resize: "\u{E740}";
     out property <string> save: "\u{E74E}";
+    out property <string> compare: "\u{E890}";
+    out property <string> chevron-left: "\u{E76B}";
+    out property <string> chevron-right: "\u{E76C}";
+    out property <string> info: "\u{E946}";
+    out property <string> open-new: "\u{E8A7}";
 }
 
 // One image in the list. tone: 0 normal, 1 success, 2 caution, 3 critical.
@@ -64,6 +69,15 @@ export struct TileData {
     out-resized: bool,
     out-size: string,
     out-tone: int,
+    // Readable: the eye button opens a live preview (or, once optimized, the saved outputs).
+    can-compare: bool,
+}
+
+// One output format in the comparison view's chips.
+export struct CompareFormat {
+    label: string,
+    detail: string,
+    available: bool,
 }
 
 component Icon inherits Text {
@@ -102,11 +116,11 @@ component GlyphButton {
         animate background { duration: 150ms; }
 
         HorizontalLayout {
-            padding-left: root.text == "" ? 9px : 14px;
-            padding-right: root.text == "" ? 9px : 16px;
+            padding-left: root.text == "" ? 9px : root.glyph == "" ? 18px : 14px;
+            padding-right: root.text == "" ? 9px : root.glyph == "" ? 18px : 16px;
             spacing: 8px;
             alignment: center;
-            Icon {
+            if root.glyph != "": Icon {
                 glyph: root.glyph;
                 color: root.fg;
                 font-size: 15px;
@@ -234,6 +248,8 @@ component SliderRow {
     in property <string> label;
     in property <float> minimum: 0;
     in property <float> maximum: 100;
+    // Shown after the value, e.g. "%" for quality.
+    in property <string> unit;
     in property <bool> enabled: true;
     in-out property <float> value;
     callback changed;
@@ -255,8 +271,8 @@ component SliderRow {
             changed(v) => { root.changed(); }
         }
         Text {
-            text: Math.round(root.value);
-            width: 28px;
+            text: Math.round(root.value) + root.unit;
+            width: 40px;
             horizontal-alignment: right;
             vertical-alignment: center;
             color: root.enabled ? Palette.foreground : Ui.tertiary;
@@ -326,6 +342,7 @@ component Tile inherits Rectangle {
     in property <TileData> data;
     in property <bool> enabled: true;
     callback toggled(bool);
+    callback compare;
 
     private property <color> tone-color: data.tone == 1 ? Ui.success : data.tone == 2 ? Ui.caution : data.tone == 3 ? Ui.critical : Palette.foreground;
 
@@ -339,7 +356,7 @@ component Tile inherits Rectangle {
         padding: 10px;
         padding-left: 8px;
         spacing: 12px;
-        VerticalLayout {
+        check-cell := VerticalLayout {
             alignment: center;
             CheckBox {
                 checked: data.selected;
@@ -454,14 +471,755 @@ component Tile inherits Rectangle {
                 }
             }
         }
+        // Room for the Compare button (placed above the click area below), so the columns
+        // line up whether or not a tile has one.
+        compare-slot := Rectangle {
+            width: 40px;
+        }
     }
 
-    // On top of everything, the checkbox included: clicking anywhere on the tile toggles it.
-    // (The checkbox only shows the state, so it always follows the model, e.g. Select all.)
+    // On top of everything: clicking the tile opens the before / after view...
     touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: data.can-compare ? pointer : default;
+        clicked => {
+            if (data.can-compare) {
+                root.compare();
+            }
+        }
+    }
+
+    // ...and clicking the checkbox column (full tile height, so it's easy to hit) ticks or
+    // unticks it. The checkbox itself only shows the state, so it always follows the model
+    // (e.g. Select all).
+    TouchArea {
+        x: 0px;
+        width: check-cell.x + check-cell.width + 6px;
         enabled: root.enabled;
         mouse-cursor: pointer;
         clicked => { root.toggled(!data.selected); }
+    }
+
+    if data.can-compare: GlyphButton {
+        x: compare-slot.x + (compare-slot.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        glyph: Glyph.compare;
+        enabled: root.enabled;
+        accessible-label: "Preview and compare with the original";
+        clicked => { root.compare(); }
+    }
+}
+
+// A small pill toggle (format and zoom choices in the comparison view).
+component Chip {
+    in property <string> text;
+    in property <bool> on;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    min-height: 28px;
+    horizontal-stretch: 0;
+    opacity: root.enabled ? 1 : 0.45;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.on;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+
+    Rectangle {
+        border-radius: 14px;
+        background: root.on ? Ui.tint : touch.has-hover ? Palette.control-background : transparent;
+        border-width: 1px;
+        border-color: root.on ? Palette.accent-background : Ui.card-border;
+        animate background { duration: 120ms; }
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            Text {
+                text: root.text;
+                font-size: 12px;
+                vertical-alignment: center;
+                color: root.on ? Palette.accent-background : Palette.foreground;
+            }
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component StageLabel inherits Rectangle {
+    in property <string> text;
+    height: 22px;
+    width: label.preferred-width + 18px;
+    border-radius: 11px;
+    background: Ui.card;
+    border-width: 1px;
+    border-color: Ui.card-border;
+    label := Text {
+        text: root.text;
+        font-size: 11px;
+        color: Ui.secondary;
+    }
+}
+
+// Before / after: the original on the left of a draggable split line, the output on the
+// right, both drawn at the same size so quality (not dimensions) is what's compared.
+component CompareView inherits Rectangle {
+    in property <string> name;
+    in property <[CompareFormat]> formats;
+    in property <int> current;
+    in property <image> original;
+    in property <image> output;
+    // Pixel size of the original; the output is stretched over the same area.
+    in property <int> image-width;
+    in property <int> image-height;
+    in property <string> output-label;
+    // Footer: "317.7 KB" / "1200 × 900" for each side, "WebP at 60% · not saved yet" over
+    // the output, and the saving between ("−72%", "saves 229.4 KB").
+    in property <string> original-size;
+    in property <string> original-dims;
+    in property <string> output-caption;
+    in property <string> output-size;
+    in property <string> output-dims;
+    in property <string> saving;
+    in property <string> saving-detail;
+    // Output size color: 0 neutral, 1 smaller (success), 2 larger (caution).
+    in property <int> output-tone;
+    private property <color> tone-color: root.output-tone == 1 ? Ui.success : root.output-tone == 2 ? Ui.caution : Palette.foreground;
+    // Shown at the bottom of the picture while something is being decoded or encoded.
+    in property <string> busy;
+    // Shown in the middle when there's nothing to compare.
+    in property <string> message;
+    // Live preview of the current settings rather than the saved outputs.
+    in property <bool> preview;
+    // The image has saved outputs, so it can switch between Saved and Preview.
+    in property <bool> has-saved;
+    // 0 fits the stage; otherwise original pixels per screen pixel (1 = 100%). When the
+    // picture is bigger than the stage, dragging pans it.
+    in-out property <float> zoom;
+    private property <[float]> zoom-levels: [0, 0.25, 0.5, 0.75, 1];
+    // Split line position across the visible stage, 0 (left) to 1 (right).
+    in-out property <float> split: 0.5;
+    callback select(int);
+    callback set-preview(bool);
+    callback close;
+
+    background: Ui.card;
+
+    // Clicks and wheel turns on empty parts of the view must not reach the list below.
+    TouchArea {
+        scroll-event(e) => { accept }
+    }
+
+    keys := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.close();
+                return accept;
+            }
+            reject
+        }
+    }
+    init => { keys.focus(); }
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 10px;
+
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                text: root.name;
+                font-size: 15px;
+                font-weight: 600;
+                color: Palette.foreground;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            // Saved outputs, or a live preview of the current settings (images that have been
+            // optimized can show either).
+            if root.has-saved: VerticalLayout {
+                alignment: center;
+                Chip {
+                    text: "Saved";
+                    on: !root.preview;
+                    clicked => { root.set-preview(false); }
+                }
+            }
+            if root.has-saved: VerticalLayout {
+                alignment: center;
+                Chip {
+                    text: "Preview";
+                    on: root.preview;
+                    clicked => { root.set-preview(true); }
+                }
+            }
+            Rectangle { width: 8px; }
+            for level in root.zoom-levels: VerticalLayout {
+                alignment: center;
+                Chip {
+                    text: level == 0 ? "Fit" : Math.round(level * 100) + "%";
+                    on: root.zoom == level;
+                    clicked => { root.zoom = level; }
+                }
+            }
+            Rectangle { width: 4px; }
+            GlyphButton {
+                glyph: Glyph.cancel;
+                accessible-label: "Close comparison";
+                clicked => { root.close(); }
+            }
+        }
+
+        // The output formats on show (saved, or what the settings would produce).
+        if root.formats.length > 0: HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            for format[i] in root.formats: Chip {
+                text: format.detail == "" ? format.label : format.label + " " + format.detail;
+                on: i == root.current;
+                enabled: format.available;
+                clicked => { root.select(i); }
+            }
+        }
+
+        stage := Rectangle {
+            vertical-stretch: 1;
+            border-radius: 10px;
+            background: Palette.background;
+            clip: true;
+
+            property <length> natural-w: root.image-width * 1phx;
+            property <length> natural-h: root.image-height * 1phx;
+            property <float> fit: root.image-width == 0 || root.image-height == 0 ? 1 : min(self.width / self.natural-w, self.height / self.natural-h);
+            property <float> scale: root.zoom == 0 ? self.fit : root.zoom;
+            property <length> shown-w: self.natural-w * self.scale;
+            property <length> shown-h: self.natural-h * self.scale;
+            // Bigger than the stage: dragging pans (and only the line's handle moves the line).
+            property <bool> pannable: self.shown-w > self.width + 0.5px || self.shown-h > self.height + 0.5px;
+            property <length> split-x: self.width * root.split;
+
+            flick := Flickable {
+                content-width: max(stage.width, stage.shown-w);
+                content-height: max(stage.height, stage.shown-h);
+                interactive: stage.pannable;
+
+                picture := Rectangle {
+                    x: max(0px, (flick.width - stage.shown-w) / 2);
+                    y: max(0px, (flick.height - stage.shown-h) / 2);
+                    width: stage.shown-w;
+                    height: stage.shown-h;
+                    // Where the split line falls inside the picture.
+                    property <length> cut: clamp(stage.split-x - flick.content-x - self.x, 0px, self.width);
+
+                    Image {
+                        width: 100%;
+                        height: 100%;
+                        source: root.original;
+                        image-fit: fill;
+                    }
+                    Rectangle {
+                        x: picture.cut;
+                        width: picture.width - picture.cut;
+                        height: 100%;
+                        clip: true;
+                        Image {
+                            x: -picture.cut;
+                            width: picture.width;
+                            height: picture.height;
+                            source: root.output;
+                            image-fit: fill;
+                        }
+                    }
+                }
+            }
+
+            // The split line and its handle.
+            Rectangle {
+                x: stage.split-x - 1px;
+                width: 2px;
+                background: Palette.accent-background;
+            }
+            Rectangle {
+                x: stage.split-x - self.width / 2;
+                y: (stage.height - self.height) / 2;
+                width: 30px;
+                height: 30px;
+                border-radius: 15px;
+                background: Palette.accent-background;
+                HorizontalLayout {
+                    alignment: center;
+                    Icon {
+                        glyph: Glyph.chevron-left;
+                        font-size: 10px;
+                        color: Palette.accent-foreground;
+                    }
+                    Icon {
+                        glyph: Glyph.chevron-right;
+                        font-size: 10px;
+                        color: Palette.accent-foreground;
+                    }
+                }
+            }
+            // When the whole picture is visible, drag anywhere to move the line. When it's
+            // bigger than the stage, drag the line itself; dragging elsewhere pans.
+            drag := TouchArea {
+                x: stage.pannable ? stage.split-x - 16px : 0px;
+                width: stage.pannable ? 32px : stage.width;
+                mouse-cursor: ew-resize;
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down) {
+                        root.split = clamp((self.x + self.mouse-x) / stage.width, 0, 1);
+                    }
+                }
+                moved => {
+                    if (self.pressed) {
+                        root.split = clamp((self.x + self.mouse-x) / stage.width, 0, 1);
+                    }
+                }
+            }
+
+            StageLabel {
+                x: 10px;
+                y: 10px;
+                text: "Original";
+            }
+            StageLabel {
+                x: stage.width - self.width - 10px;
+                y: 10px;
+                text: root.output-label;
+            }
+
+            if root.message != "": Rectangle {
+                width: msg.preferred-width + 28px;
+                height: 34px;
+                border-radius: 17px;
+                background: Ui.card;
+                msg := Text {
+                    text: root.message;
+                    color: Ui.secondary;
+                }
+            }
+            // "Loading…" / "Updating preview…": at the bottom, so the picture stays visible.
+            if root.busy != "": Rectangle {
+                y: stage.height - self.height - 12px;
+                width: busy-text.preferred-width + 28px;
+                height: 28px;
+                border-radius: 14px;
+                background: Ui.card;
+                border-width: 1px;
+                border-color: Ui.card-border;
+                busy-text := Text {
+                    text: root.busy;
+                    font-size: 12px;
+                    color: Ui.secondary;
+                }
+            }
+        }
+
+        // Sizes: the original under the original's side of the split, the output under the
+        // output's side, and what it saves in between.
+        HorizontalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                Text {
+                    text: "Original";
+                    font-size: 11px;
+                    color: Ui.tertiary;
+                }
+                Text {
+                    text: root.original-size;
+                    font-size: 20px;
+                    font-weight: 600;
+                    color: Palette.foreground;
+                }
+                Text {
+                    text: root.original-dims;
+                    font-size: 12px;
+                    color: Ui.secondary;
+                }
+            }
+            if root.saving != "": VerticalLayout {
+                alignment: center;
+                spacing: 4px;
+                HorizontalLayout {
+                    alignment: center;
+                    Rectangle {
+                        height: 26px;
+                        width: badge.preferred-width + 22px;
+                        border-radius: 13px;
+                        background: root.tone-color.with-alpha(Ui.dark ? 0.18 : 0.12);
+                        badge := Text {
+                            text: root.saving;
+                            font-size: 13px;
+                            font-weight: 600;
+                            color: root.tone-color;
+                        }
+                    }
+                }
+                Text {
+                    text: root.saving-detail;
+                    font-size: 11px;
+                    color: Ui.tertiary;
+                    horizontal-alignment: center;
+                }
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                Text {
+                    text: root.output-caption;
+                    font-size: 11px;
+                    color: Ui.tertiary;
+                    horizontal-alignment: right;
+                    overflow: elide;
+                }
+                Text {
+                    text: root.output-size;
+                    font-size: 20px;
+                    font-weight: 600;
+                    color: root.tone-color;
+                    horizontal-alignment: right;
+                }
+                Text {
+                    text: root.output-dims;
+                    font-size: 12px;
+                    color: Ui.secondary;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+    }
+}
+
+// A label in spaced-out capitals ("IMAGE OPTIMIZER", "MADE BY").
+component Eyebrow inherits Text {
+    font-family: "Consolas";
+    font-size: 13px;
+    letter-spacing: 4px;
+    color: Ui.secondary;
+}
+
+// An underlined link with an "open in new window" mark.
+component Link {
+    in property <string> text;
+    callback clicked;
+
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+
+    HorizontalLayout {
+        spacing: 6px;
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            Text {
+                text: root.text;
+                font-family: "Consolas";
+                font-size: 15px;
+                color: touch.has-hover ? Palette.accent-background : Palette.foreground;
+            }
+            Rectangle {
+                height: 1px;
+                background: touch.has-hover ? Palette.accent-background : Palette.foreground;
+            }
+        }
+        Icon {
+            glyph: Glyph.open-new;
+            font-size: 12px;
+            color: touch.has-hover ? Palette.accent-background : Palette.foreground;
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+struct LicenseEntry {
+    name: string,
+    detail: string,
+}
+
+// The About dialog: a card centered over the dimmed window, with a Licenses view. Clicking
+// outside it or pressing Esc closes it (Esc on the Licenses view goes back first).
+component AboutDialog inherits Rectangle {
+    in property <string> version;
+    in property <string> build;
+    callback check-updates;
+    callback open-website;
+    callback open-source;
+    callback close;
+
+    // Showing the Licenses view.
+    in-out property <bool> licenses;
+    property <[LicenseEntry]> components: [
+        { name: "mozjpeg", detail: "JPEG encoder · IJG, BSD-3-Clause and zlib licenses" },
+        { name: "libwebp", detail: "WebP encoder · BSD-3-Clause" },
+        { name: "rav1e, ravif", detail: "AVIF encoder · BSD-2-Clause, BSD-3-Clause" },
+        { name: "oxipng", detail: "PNG optimizer · MIT" },
+        { name: "image", detail: "Image decoding · MIT or Apache-2.0" },
+        { name: "Rust crates", detail: "rayon, rfd, serde, walkdir and others · MIT, Apache-2.0 or similar permissive licenses" },
+    ];
+
+    background: #00000080;
+
+    // Clicks outside the card close it; nothing reaches the window below.
+    TouchArea {
+        clicked => { root.close(); }
+        scroll-event(e) => { accept }
+    }
+    keys := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                if (root.licenses) {
+                    root.licenses = false;
+                } else {
+                    root.close();
+                }
+                return accept;
+            }
+            reject
+        }
+    }
+    init => { keys.focus(); }
+
+    card := Rectangle {
+        width: min(560px, root.width - 32px);
+        height: min(content.preferred-height, root.height - 32px);
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        background: Ui.card;
+        border-radius: 16px;
+        border-width: 1px;
+        border-color: Ui.card-border;
+        clip: true;
+
+        // Clicks on the card itself don't close it.
+        TouchArea { }
+
+        content := VerticalLayout {
+            // ---- title bar
+            Rectangle {
+                height: 56px;
+                background: Palette.control-background;
+                HorizontalLayout {
+                    padding-left: root.licenses ? 10px : 22px;
+                    padding-right: 12px;
+                    spacing: 6px;
+                    if root.licenses: VerticalLayout {
+                        alignment: center;
+                        GlyphButton {
+                            glyph: Glyph.chevron-left;
+                            accessible-label: "Back";
+                            clicked => { root.licenses = false; }
+                        }
+                    }
+                    Text {
+                        text: root.licenses ? "Licenses" : "About Gravingine";
+                        font-size: 16px;
+                        font-weight: 600;
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        GlyphButton {
+                            glyph: Glyph.cancel;
+                            accessible-label: "Close";
+                            clicked => { root.close(); }
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                height: 1px;
+                background: Ui.card-border;
+            }
+
+            // ---- the app
+            if !root.licenses: VerticalLayout {
+                padding: 32px;
+                padding-top: 40px;
+                spacing: 0px;
+                HorizontalLayout {
+                    alignment: center;
+                    Image {
+                        source: @image-url("../res/gravingine-logo.svg");
+                        width: 104px;
+                        height: 104px;
+                        accessible-role: image;
+                        accessible-label: "Gravingine logo";
+                    }
+                }
+                Text {
+                    text: "Gravingine";
+                    font-size: 50px;
+                    font-weight: 700;
+                    color: Palette.foreground;
+                    horizontal-alignment: center;
+                }
+                Eyebrow {
+                    text: "IMAGE OPTIMIZER";
+                    font-size: 16px;
+                    letter-spacing: 7px;
+                    horizontal-alignment: center;
+                }
+                Rectangle { height: 26px; }
+                HorizontalLayout {
+                    alignment: center;
+                    Rectangle {
+                        height: 38px;
+                        width: version-text.preferred-width + 40px;
+                        border-radius: 19px;
+                        border-width: 1px;
+                        border-color: Ui.card-border;
+                        background: Palette.background;
+                        version-text := Text {
+                            text: "Version " + root.version + " · Build " + root.build;
+                            font-family: "Consolas";
+                            font-size: 14px;
+                            color: Palette.foreground;
+                        }
+                    }
+                }
+                Rectangle { height: 26px; }
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 12px;
+                    GlyphButton {
+                        text: "Check for updates";
+                        primary: true;
+                        clicked => { root.check-updates(); }
+                    }
+                    GlyphButton {
+                        text: "Licenses";
+                        clicked => { root.licenses = true; }
+                    }
+                }
+            }
+
+            // ---- the maker
+            if !root.licenses: Rectangle {
+                background: Palette.background;
+                VerticalLayout {
+                    padding: 24px;
+                    padding-left: 28px;
+                    padding-right: 28px;
+                    spacing: 16px;
+                    HorizontalLayout {
+                        spacing: 16px;
+                        VerticalLayout {
+                            alignment: center;
+                            Image {
+                                source: @image-url("../res/gravitide-icon.svg");
+                                width: 60px;
+                                height: 60px;
+                                accessible-role: image;
+                                accessible-label: "Gravitide logo";
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            Eyebrow { text: "MADE BY"; }
+                            Text {
+                                text: "Gravitide";
+                                font-size: 24px;
+                                font-weight: 700;
+                                color: Palette.foreground;
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Link {
+                            text: "gravitide.dev";
+                            clicked => { root.open-website(); }
+                        }
+                    }
+                    Text {
+                        text: "© 2026 Gravitide Pvt Ltd. Free and open source under the MIT license.";
+                        font-size: 12px;
+                        color: Ui.secondary;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            // ---- licenses
+            if root.licenses: VerticalLayout {
+                padding: 24px;
+                spacing: 12px;
+                HorizontalLayout {
+                    spacing: 16px;
+                    AboutSlint {
+                        horizontal-stretch: 0;
+                        max-width: 190px;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        Text {
+                            text: "Slint";
+                            font-weight: 600;
+                            color: Palette.foreground;
+                        }
+                        Text {
+                            text: "User interface toolkit · Slint Royalty-free License 2.0";
+                            font-size: 12px;
+                            color: Ui.secondary;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 1px;
+                    background: Ui.card-border;
+                }
+                for entry in root.components: HorizontalLayout {
+                    spacing: 12px;
+                    Text {
+                        text: entry.name;
+                        width: 110px;
+                        font-weight: 600;
+                        color: Palette.foreground;
+                    }
+                    Text {
+                        text: entry.detail;
+                        font-size: 12px;
+                        color: Ui.secondary;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    height: 1px;
+                    background: Ui.card-border;
+                }
+                HorizontalLayout {
+                    spacing: 12px;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: "Gravingine Image Optimizer is MIT licensed. The full license texts are in each project's repository.";
+                            font-size: 12px;
+                            color: Ui.secondary;
+                            wrap: word-wrap;
+                        }
+                    }
+                    Link {
+                        text: "Source code";
+                        clicked => { root.open-source(); }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -508,6 +1266,44 @@ export component AppWindow inherits Window {
     in property <bool> can-select-none;
     in property <bool> has-output;
     in property <string> resize-hint;
+
+    // ---- before / after comparison (written by Rust)
+    in property <bool> compare-open;
+    in property <string> compare-name;
+    in property <[CompareFormat]> compare-formats;
+    in property <int> compare-current;
+    in property <image> compare-original;
+    in property <image> compare-output;
+    in property <int> compare-width;
+    in property <int> compare-height;
+    in property <string> compare-output-label;
+    in property <string> compare-original-size;
+    in property <string> compare-original-dims;
+    in property <string> compare-output-caption;
+    in property <string> compare-output-size;
+    in property <string> compare-output-dims;
+    in property <string> compare-saving;
+    in property <string> compare-saving-detail;
+    in property <string> compare-busy;
+    in property <int> compare-output-tone;
+    in property <bool> compare-preview;
+    in property <bool> compare-has-saved;
+    in property <string> compare-message;
+    in-out property <float> compare-zoom;
+    in-out property <float> compare-split: 0.5;
+    callback compare(int);
+    callback compare-select(int);
+    callback compare-mode(bool);
+
+    // ---- about
+    in property <string> app-version;
+    in property <string> app-build;
+    in-out property <bool> about-open;
+    in-out property <bool> about-licenses;
+    callback open-source;
+    callback open-releases;
+    callback open-website;
+    callback compare-close;
 
     callback add-files;
     callback add-folder;
@@ -579,6 +1375,7 @@ export component AppWindow inherits Window {
                         toggled => { root.settings-changed(); }
                         SliderRow {
                             label: "Quality";
+                            unit: "%";
                             minimum: 1;
                             maximum: 100;
                             value <=> root.webp-quality;
@@ -601,6 +1398,7 @@ export component AppWindow inherits Window {
                         toggled => { root.settings-changed(); }
                         SliderRow {
                             label: "Quality";
+                            unit: "%";
                             minimum: 1;
                             maximum: 100;
                             value <=> root.avif-quality;
@@ -625,6 +1423,7 @@ export component AppWindow inherits Window {
                         toggled => { root.settings-changed(); }
                         SliderRow {
                             label: "Quality";
+                            unit: "%";
                             minimum: 1;
                             maximum: 100;
                             value <=> root.jpeg-quality;
@@ -750,7 +1549,6 @@ export component AppWindow inherits Window {
             spacing: 12px;
             HorizontalLayout {
                 spacing: 8px;
-                alignment: start;
                 GlyphButton {
                     glyph: Glyph.select-all;
                     text: "Select all";
@@ -762,6 +1560,15 @@ export component AppWindow inherits Window {
                     text: "Select none";
                     enabled: root.can-select-none;
                     clicked => { root.select-none(); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                GlyphButton {
+                    glyph: Glyph.info;
+                    text: "About";
+                    clicked => {
+                        root.about-licenses = false;
+                        root.about-open = true;
+                    }
                 }
             }
 
@@ -782,6 +1589,7 @@ export component AppWindow inherits Window {
                         data: tile;
                         enabled: root.idle;
                         toggled(on) => { root.tile-toggled(i, on); }
+                        compare => { root.compare(i); }
                     }
                 }
 
@@ -812,6 +1620,35 @@ export component AppWindow inherits Window {
                         font-size: 12px;
                         color: Ui.tertiary;
                     }
+                }
+
+                // Before / after comparison, over the list.
+                if root.compare-open: CompareView {
+                    name: root.compare-name;
+                    formats: root.compare-formats;
+                    current: root.compare-current;
+                    original: root.compare-original;
+                    output: root.compare-output;
+                    image-width: root.compare-width;
+                    image-height: root.compare-height;
+                    output-label: root.compare-output-label;
+                    original-size: root.compare-original-size;
+                    original-dims: root.compare-original-dims;
+                    output-caption: root.compare-output-caption;
+                    output-size: root.compare-output-size;
+                    output-dims: root.compare-output-dims;
+                    saving: root.compare-saving;
+                    saving-detail: root.compare-saving-detail;
+                    busy: root.compare-busy;
+                    output-tone: root.compare-output-tone;
+                    preview: root.compare-preview;
+                    has-saved: root.compare-has-saved;
+                    message: root.compare-message;
+                    zoom <=> root.compare-zoom;
+                    split <=> root.compare-split;
+                    select(i) => { root.compare-select(i); }
+                    set-preview(on) => { root.compare-mode(on); }
+                    close => { root.compare-close(); }
                 }
             }
 
@@ -861,5 +1698,19 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    if root.about-open: AboutDialog {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        version: root.app-version;
+        build: root.app-build;
+        licenses <=> root.about-licenses;
+        check-updates => { root.open-releases(); }
+        open-website => { root.open-website(); }
+        open-source => { root.open-source(); }
+        close => { root.about-open = false; }
     }
 }

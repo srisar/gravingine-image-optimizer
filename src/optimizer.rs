@@ -183,19 +183,67 @@ pub fn target_size(w: u32, h: u32, settings: &Settings) -> Option<(u32, u32)> {
     Some((new(w), new(h)))
 }
 
-/// Decode, optionally resize and encode one source to every enabled format.
-pub fn process(src: &Source, settings: &Settings) -> Result<Vec<FormatResult>> {
-    let original_bytes = fs::read(&src.path).with_context(|| format!("reading {}", src.path.display()))?;
-    let original_size = original_bytes.len() as u64;
+/// A source image read and decoded once, ready to encode (several times, for previews).
+pub struct Decoded {
+    bytes: Vec<u8>,
+    image: DynamicImage,
+}
 
-    let mut img = decode(&original_bytes)?;
-    let target = target_size(img.width(), img.height(), settings);
-    let resized = target.is_some();
-    if let Some((w, h)) = target {
-        img = img.resize_exact(w, h, FilterType::Lanczos3);
+impl Decoded {
+    pub fn open(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let image = decode(&bytes)?;
+        Ok(Decoded { bytes, image })
     }
 
-    let source_is_png = image::guess_format(&original_bytes).ok() == Some(image::ImageFormat::Png);
+    /// Size of the original file in bytes.
+    pub fn file_size(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    /// The upright original pixels.
+    pub fn rgba(&self) -> image::RgbaImage {
+        self.image.to_rgba8()
+    }
+
+    /// The image at the size `settings` ask for, and whether that is a resize.
+    fn resized(&self, settings: &Settings) -> (std::borrow::Cow<'_, DynamicImage>, bool) {
+        match target_size(self.image.width(), self.image.height(), settings) {
+            Some((w, h)) => (std::borrow::Cow::Owned(self.image.resize_exact(w, h, FilterType::Lanczos3)), true),
+            None => (std::borrow::Cow::Borrowed(&self.image), false),
+        }
+    }
+
+    /// Encode `img` (this image, possibly resized) as `format`, in memory.
+    fn encode(&self, img: &DynamicImage, resized: bool, format: Format, settings: &Settings) -> Result<Vec<u8>> {
+        catch_unwind(AssertUnwindSafe(|| match format {
+            Format::Jpeg => encode_jpeg(img, settings.jpeg_quality),
+            Format::WebP => encode_webp(img, settings.webp_quality, settings.webp_lossless),
+            Format::Avif => encode_avif(img, settings.avif_quality, settings.avif_speed),
+            Format::Png => {
+                // Re-compress the original PNG directly when possible: keeps palettes/bit depth.
+                let source_is_png = image::guess_format(&self.bytes).ok() == Some(image::ImageFormat::Png);
+                let input = if source_is_png && !resized { Some(&self.bytes[..]) } else { None };
+                encode_png(img, input, settings.png_level)
+            }
+        }))
+        .unwrap_or_else(|_| Err(anyhow!("encoder crashed")))
+    }
+}
+
+/// What `format` with `settings` would produce, without saving anything: the encoded size
+/// and its pixels decoded back (so compression artifacts show). See [`can_preview`].
+pub fn preview(decoded: &Decoded, format: Format, settings: &Settings) -> Result<(u64, image::RgbaImage)> {
+    let (img, resized) = decoded.resized(settings);
+    let data = decoded.encode(&img, resized, format, settings)?;
+    Ok((data.len() as u64, decode(&data)?.to_rgba8()))
+}
+
+/// Decode, optionally resize and encode one source to every enabled format.
+pub fn process(src: &Source, settings: &Settings) -> Result<Vec<FormatResult>> {
+    let decoded = Decoded::open(&src.path)?;
+    let original_size = decoded.file_size();
+    let (img, resized) = decoded.resized(settings);
     let out_dir = output_dir(src, settings);
     let stem = src
         .path
@@ -207,18 +255,7 @@ pub fn process(src: &Source, settings: &Settings) -> Result<Vec<FormatResult>> {
         .formats()
         .into_iter()
         .map(|format| {
-            let encoded = catch_unwind(AssertUnwindSafe(|| match format {
-                Format::Jpeg => encode_jpeg(&img, settings.jpeg_quality),
-                Format::WebP => encode_webp(&img, settings.webp_quality, settings.webp_lossless),
-                Format::Avif => encode_avif(&img, settings.avif_quality, settings.avif_speed),
-                Format::Png => {
-                    // Re-compress the original PNG directly when possible: keeps palettes/bit depth.
-                    let input = if source_is_png && !resized { Some(&original_bytes[..]) } else { None };
-                    encode_png(&img, input, settings.png_level)
-                }
-            }))
-            .unwrap_or_else(|_| Err(anyhow!("encoder crashed")));
-
+            let encoded = decoded.encode(&img, resized, format, settings);
             let outcome = match encoded {
                 Err(e) => Outcome::Failed(format!("{e:#}")),
                 Ok(data) => {
@@ -310,6 +347,17 @@ pub fn thumbnail(path: &Path, size: u32) -> Result<Thumbnail> {
     let (width, height) = (img.width(), img.height());
     let small = img.resize_to_fill(size, size, FilterType::Triangle).to_rgba8();
     Ok(Thumbnail { size: small.width(), rgba: small.into_raw(), width, height, format })
+}
+
+/// Whether [`load_rgba`] can read this output format (there's no AVIF decoder built in).
+pub fn can_preview(format: Format) -> bool {
+    format != Format::Avif
+}
+
+/// Full-size RGBA pixels of an image file, upright (EXIF orientation applied), for previews.
+pub fn load_rgba(path: &Path) -> Result<image::RgbaImage> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(decode(&bytes)?.to_rgba8())
 }
 
 fn decode(bytes: &[u8]) -> Result<DynamicImage> {
@@ -475,6 +523,23 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn preview_encodes_in_memory_at_the_output_size() {
+        let dir = temp_dir("preview");
+        let src_path = dir.join("photo.png");
+        sample_image(false).save(&src_path).unwrap();
+        let decoded = Decoded::open(&src_path).unwrap();
+        let settings = Settings { resize: true, max_width: 160, max_height: 0, ..Settings::default() };
+        for format in [Format::Jpeg, Format::WebP, Format::Png] {
+            let (size, pixels) = preview(&decoded, format, &settings).unwrap();
+            assert!(size > 0, "{format:?}");
+            assert_eq!(pixels.dimensions(), (160, 100), "{format:?}");
+        }
+        // Nothing is written next to the image.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
