@@ -247,7 +247,7 @@ impl Decoded {
 }
 
 /// What `format` with `settings` would produce, without saving anything: the encoded size
-/// and its pixels decoded back (so compression artifacts show). See [`can_preview`].
+/// and its pixels decoded back (so compression artifacts show).
 pub fn preview(decoded: &Decoded, format: Format, settings: &Settings) -> Result<(u64, image::RgbaImage)> {
     let (img, resized) = decoded.resized(settings);
     let data = decoded.encode(&img, resized, format, settings)?;
@@ -364,11 +364,6 @@ pub fn thumbnail(path: &Path, size: u32) -> Result<Thumbnail> {
     Ok(Thumbnail { size: small.width(), rgba: small.into_raw(), width, height, format })
 }
 
-/// Whether [`load_rgba`] can read this output format (there's no AVIF decoder built in).
-pub fn can_preview(format: Format) -> bool {
-    format != Format::Avif
-}
-
 /// Full-size RGBA pixels of an image file, upright (EXIF orientation applied), for previews.
 pub fn load_rgba(path: &Path) -> Result<image::RgbaImage> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -376,6 +371,10 @@ pub fn load_rgba(path: &Path) -> Result<image::RgbaImage> {
 }
 
 fn decode(bytes: &[u8]) -> Result<DynamicImage> {
+    // The image crate has no AVIF decoder here; avif-decode (pure Rust, rav1d) reads AVIF.
+    if is_avif(bytes) {
+        return decode_avif(bytes).map(DynamicImage::ImageRgba8);
+    }
     let mut decoder = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()?
         .into_decoder()
@@ -387,6 +386,36 @@ fn decode(bytes: &[u8]) -> Result<DynamicImage> {
         img.apply_orientation(o);
     }
     Ok(img)
+}
+
+/// An AVIF file: an ISO-BMFF `ftyp` box with the `avif` (image) or `avis` (sequence) brand.
+fn is_avif(bytes: &[u8]) -> bool {
+    bytes.get(4..12).is_some_and(|b| b == b"ftypavif" || b == b"ftypavis")
+}
+
+/// Decode an AVIF file to 8-bit RGBA.
+fn decode_avif(bytes: &[u8]) -> Result<image::RgbaImage> {
+    use avif_decode::Image;
+    let image = avif_decode::Decoder::from_avif(bytes)
+        .and_then(|d| d.to_image())
+        .map_err(|e| anyhow!("decoding AVIF: {e}"))?;
+    // 16-bit samples use the full 0..=65535 range.
+    let wide = |v: u16| (v >> 8) as u8;
+    let (width, height, rgba): (usize, usize, Vec<u8>) = match image {
+        Image::Rgb8(img) => (img.width(), img.height(), img.pixels().flat_map(|p| [p.r, p.g, p.b, 255]).collect()),
+        Image::Rgba8(img) => (img.width(), img.height(), img.pixels().flat_map(|p| [p.r, p.g, p.b, p.a]).collect()),
+        Image::Rgb16(img) => {
+            (img.width(), img.height(), img.pixels().flat_map(|p| [wide(p.r), wide(p.g), wide(p.b), 255]).collect())
+        }
+        Image::Rgba16(img) => {
+            (img.width(), img.height(), img.pixels().flat_map(|p| [wide(p.r), wide(p.g), wide(p.b), wide(p.a)]).collect())
+        }
+        Image::Gray8(img) => (img.width(), img.height(), img.pixels().flat_map(|p| { let v = p.value(); [v, v, v, 255] }).collect()),
+        Image::Gray16(img) => {
+            (img.width(), img.height(), img.pixels().flat_map(|p| { let v = wide(p.value()); [v, v, v, 255] }).collect())
+        }
+    };
+    image::RgbaImage::from_raw(width as u32, height as u32, rgba).context("decoding AVIF: unexpected pixel buffer size")
 }
 
 fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>> {
@@ -541,6 +570,28 @@ mod tests {
     }
 
     #[test]
+    fn avif_round_trips_through_the_decoder() {
+        for alpha in [false, true] {
+            let original = sample_image(alpha);
+            let avif = encode_avif(&original, 90, 10).unwrap();
+            assert!(is_avif(&avif));
+            let decoded = decode(&avif).unwrap().to_rgba8();
+            assert_eq!(decoded.dimensions(), (original.width(), original.height()));
+            // Close to the original on average (catches wrong bit-depth scaling, swapped
+            // channels or lost alpha, which are off by far more than compression).
+            let original = original.to_rgba8();
+            let diff: u64 = original
+                .as_raw()
+                .iter()
+                .zip(decoded.as_raw())
+                .map(|(a, b)| a.abs_diff(*b) as u64)
+                .sum();
+            let mean = diff as f64 / original.as_raw().len() as f64;
+            assert!(mean < 6.0, "alpha={alpha}: mean difference {mean:.2}");
+        }
+    }
+
+    #[test]
     fn preview_encodes_in_memory_at_the_output_size() {
         let dir = temp_dir("preview");
         let src_path = dir.join("photo.png");
@@ -599,11 +650,9 @@ mod tests {
                 ("png", encode_png(&img, None, 1).unwrap()),
             ] {
                 assert!(data.len() > 20, "{name} alpha={alpha} produced {} bytes", data.len());
-                if name != "avif" {
-                    // Round-trip through the decoder to make sure the output is valid.
-                    let back = image::load_from_memory(&data).unwrap();
-                    assert_eq!((back.width(), back.height()), (320, 200), "{name}");
-                }
+                // Round-trip through the decoder to make sure the output is valid.
+                let back = decode(&data).unwrap();
+                assert_eq!((back.width(), back.height()), (320, 200), "{name}");
             }
         }
     }
