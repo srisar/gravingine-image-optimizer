@@ -19,7 +19,44 @@ use crate::optimizer::{self, Format, FormatResult, OutputLocation, Outcome, Resi
 use crate::taskbar::{self, Taskbar};
 use crate::{AppWindow, CompareFormat, TileData, Ui, winicon};
 
-const PERCENT_PRESETS: [u32; 3] = [75, 50, 25];
+/// One entry of the resize dropdown.
+#[derive(Clone, Copy, PartialEq)]
+enum ResizeChoice {
+    /// A named size: fit within it, turned to match the image (`ResizeMode::Box`).
+    Size(&'static str, u32, u32),
+    /// Scale to a fixed percentage.
+    Percent(u32),
+    /// The max width / height fields (`ResizeMode::FitWithin`).
+    CustomSize,
+    /// The percent field.
+    CustomPercent,
+}
+
+/// The resize dropdown, in order. Images are never enlarged.
+const RESIZE_CHOICES: [ResizeChoice; 11] = [
+    ResizeChoice::Size("Thumbnails", 230, 230),
+    ResizeChoice::Size("Small", 640, 480),
+    ResizeChoice::Size("Medium", 800, 600),
+    ResizeChoice::Size("Large", 1024, 768),
+    ResizeChoice::Size("HD", 1920, 1080),
+    ResizeChoice::Size("4K", 3840, 2160),
+    ResizeChoice::Percent(25),
+    ResizeChoice::Percent(50),
+    ResizeChoice::Percent(75),
+    ResizeChoice::CustomSize,
+    ResizeChoice::CustomPercent,
+];
+
+impl ResizeChoice {
+    fn label(self) -> String {
+        match self {
+            ResizeChoice::Size(name, w, h) => format!("{name} ({w} × {h})"),
+            ResizeChoice::Percent(p) => format!("Reduce to {p}%"),
+            ResizeChoice::CustomSize => "Custom size".into(),
+            ResizeChoice::CustomPercent => "Custom percentage".into(),
+        }
+    }
+}
 /// Thumbnail size in the list (logical pixels).
 const THUMB: f32 = 72.0;
 const IMAGE_EXTENSIONS: [&str; 10] = ["jpg", "jpeg", "jfif", "png", "webp", "gif", "bmp", "tif", "tiff", "ico"];
@@ -222,6 +259,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
     ui.global::<Ui>().set_icon_font(winicon::icon_font_face().into());
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     ui.set_app_build(env!("GIO_BUILD").into());
+    let resize_options: Vec<slint::SharedString> = RESIZE_CHOICES.iter().map(|c| c.label().into()).collect();
+    ui.set_resize_options(ModelRc::new(VecModel::from(resize_options)));
+    let index_of = |wanted: ResizeChoice| RESIZE_CHOICES.iter().position(|c| *c == wanted).unwrap_or(0) as i32;
+    ui.set_resize_custom_size(index_of(ResizeChoice::CustomSize));
+    ui.set_resize_custom_percent(index_of(ResizeChoice::CustomPercent));
     match std::env::var("GIO_THEME").as_deref() {
         Ok("dark") => ui.invoke_set_dark(true),
         Ok("light") => ui.invoke_set_dark(false),
@@ -592,6 +634,7 @@ impl App {
         let mut changed: Vec<usize> = Vec::new();
         let mut finished = false;
         let progress: (u64, u64);
+        let clear_when_done = self.ui.get_clear_when_done();
         {
             let mut st = self.state.borrow_mut();
             let Some(run) = &st.run else { return };
@@ -616,12 +659,17 @@ impl App {
             let done = st.jobs.iter().filter(|j| j.selected && matches!(j.status, Status::Done(_) | Status::Failed(_))).count();
             progress = (done as u64, total as u64);
             if finished && let Some(run) = st.run.take() {
-                st.elapsed = Some(run.started.elapsed().as_secs_f32());
-                if run.cancel.load(Ordering::SeqCst) {
+                let secs = run.started.elapsed().as_secs_f32();
+                st.elapsed = Some(secs);
+                let cancelled = run.cancel.load(Ordering::SeqCst);
+                if cancelled {
                     st.notice = "Cancelled.".into();
                     for job in st.jobs.iter_mut().filter(|j| matches!(j.status, Status::Running)) {
                         job.status = Status::Pending;
                     }
+                }
+                if clear_when_done {
+                    clear_optimized(&mut st, secs, cancelled);
                 }
             }
         }
@@ -996,9 +1044,26 @@ impl App {
         ui.set_progress(progress);
         ui.set_has_output(has_output);
         ui.set_status(status.into());
-        let pct = settings.resize_percent;
-        let side = |s: u32| ((s as f64 * pct as f64 / 100.0).round() as u32).max(1);
-        ui.set_resize_hint(format!("Example: 4000 × 3000 → {} × {}", side(4000), side(3000)).into());
+        ui.set_resize_hint(
+            match self.resize_choice() {
+                ResizeChoice::Size(_, w, h) if w == h => format!("Fits within {w} × {h}. Never enlarges."),
+                ResizeChoice::Size(_, w, h) => {
+                    format!("Fits within {w} × {h}, or {h} × {w} for portrait images. Never enlarges.")
+                }
+                ResizeChoice::Percent(_) | ResizeChoice::CustomPercent => {
+                    let pct = settings.resize_percent;
+                    let side = |s: u32| ((s as f64 * pct as f64 / 100.0).round() as u32).max(1);
+                    format!("Example: 4000 × 3000 → {} × {}", side(4000), side(3000))
+                }
+                ResizeChoice::CustomSize => String::new(),
+            }
+            .into(),
+        );
+    }
+
+    /// The resize dropdown's current choice.
+    fn resize_choice(&self) -> ResizeChoice {
+        RESIZE_CHOICES.get(self.ui.get_resize_mode() as usize).copied().unwrap_or(ResizeChoice::CustomSize)
     }
 
     // -------------------------------------------------------------- settings
@@ -1017,10 +1082,18 @@ impl App {
         ui.set_png_level(s.png_level as f32);
         ui.set_resize(s.resize);
         let percent = s.resize_percent.clamp(1, 100);
-        ui.set_resize_mode(match s.resize_mode {
-            ResizeMode::FitWithin => 0,
-            ResizeMode::Percent => PERCENT_PRESETS.iter().position(|p| *p == percent).map_or(4, |i| i as i32 + 1),
+        let index_of = |wanted: ResizeChoice| RESIZE_CHOICES.iter().position(|c| *c == wanted).unwrap_or(0);
+        let saved = RESIZE_CHOICES.iter().position(|c| match (*c, s.resize_mode) {
+            (ResizeChoice::Size(_, w, h), ResizeMode::Box) => (w, h) == (s.box_width, s.box_height),
+            (ResizeChoice::Percent(p), ResizeMode::Percent) => p == percent,
+            (ResizeChoice::CustomSize, ResizeMode::FitWithin) => true,
+            _ => false,
         });
+        ui.set_resize_mode(match (saved, s.resize_mode) {
+            (Some(i), _) => i,
+            (None, ResizeMode::Percent) => index_of(ResizeChoice::CustomPercent),
+            (None, _) => index_of(ResizeChoice::CustomSize),
+        } as i32);
         ui.set_percent(percent.to_string().into());
         ui.set_limit_width(s.max_width.to_string().into());
         ui.set_limit_height(s.max_height.to_string().into());
@@ -1033,16 +1106,19 @@ impl App {
         }
         ui.set_skip_larger(s.skip_if_larger);
         ui.set_overwrite(s.overwrite);
+        ui.set_clear_when_done(s.clear_when_done);
     }
 
     fn read_settings(&self) -> Settings {
         let ui = &self.ui;
         let num = |t: slint::SharedString, default: u32| t.trim().parse::<u32>().unwrap_or(default);
         let custom_percent = num(ui.get_percent(), 50).clamp(1, 100);
-        let (resize_mode, resize_percent) = match ui.get_resize_mode() {
-            0 => (ResizeMode::FitWithin, custom_percent),
-            i @ 1..=3 => (ResizeMode::Percent, PERCENT_PRESETS[i as usize - 1]),
-            _ => (ResizeMode::Percent, custom_percent),
+        let defaults = Settings::default();
+        let (resize_mode, resize_percent, (box_width, box_height)) = match self.resize_choice() {
+            ResizeChoice::Size(_, w, h) => (ResizeMode::Box, custom_percent, (w, h)),
+            ResizeChoice::Percent(p) => (ResizeMode::Percent, p, (defaults.box_width, defaults.box_height)),
+            ResizeChoice::CustomSize => (ResizeMode::FitWithin, custom_percent, (defaults.box_width, defaults.box_height)),
+            ResizeChoice::CustomPercent => (ResizeMode::Percent, custom_percent, (defaults.box_width, defaults.box_height)),
         };
         let slider = |v: f32, lo: f32, hi: f32| v.round().clamp(lo, hi) as u8;
         let dir = ui.get_output_dir().trim().to_string();
@@ -1060,6 +1136,8 @@ impl App {
             resize: ui.get_resize(),
             resize_mode,
             resize_percent,
+            box_width,
+            box_height,
             max_width: num(ui.get_limit_width(), 0),
             max_height: num(ui.get_limit_height(), 0),
             output: if ui.get_save_mode() == 1 && !dir.is_empty() {
@@ -1069,6 +1147,7 @@ impl App {
             },
             skip_if_larger: ui.get_skip_larger(),
             overwrite: ui.get_overwrite(),
+            clear_when_done: ui.get_clear_when_done(),
         }
     }
 }
@@ -1266,6 +1345,7 @@ fn plan_text(s: &Settings) -> String {
     let size = match (s.resize, s.resize_mode) {
         (false, _) => "original size".to_string(),
         (true, ResizeMode::Percent) => format!("resized to {}%", s.resize_percent),
+        (true, ResizeMode::Box) => format!("fit {} × {}", s.box_width, s.box_height),
         (true, ResizeMode::FitWithin) => {
             let side = |v: u32| if v == 0 { "any".to_string() } else { v.to_string() };
             format!("fit {} × {}", side(s.max_width), side(s.max_height))
@@ -1284,6 +1364,37 @@ fn row_error(job: &Job) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+/// "Clear images from the list once optimized": images that finished without errors leave
+/// the list (failures stay, so their errors can be read; unticked images weren't part of the
+/// run). Their totals move into the status line, since their tiles are gone.
+fn clear_optimized(st: &mut State, secs: f32, cancelled: bool) {
+    let (cleared, kept): (Vec<Job>, Vec<Job>) =
+        std::mem::take(&mut st.jobs).into_iter().partition(|j| matches!(j.status, Status::Done(_)) && row_error(j).is_none());
+    st.jobs = kept;
+    if cleared.is_empty() {
+        return;
+    }
+    for job in &cleared {
+        st.known.remove(&job.source.path);
+    }
+    // The run's time goes in this summary, not after the totals of what's left.
+    st.elapsed = None;
+    let n = cleared.len();
+    // "Cleared 2 optimized images · saved 143.8 KB (77%) in 0.2s"
+    let mut notice = format!(
+        "{}Cleared {n} optimized image{}",
+        if cancelled { "Cancelled. " } else { "" },
+        if n == 1 { "" } else { "s" },
+    );
+    if let Some((orig, best)) = totals(&cleared) {
+        let saved = orig.saturating_sub(best);
+        let pct = if orig == 0 { 0.0 } else { saved as f64 * 100.0 / orig as f64 };
+        notice.push_str(&format!(" · saved {} ({pct:.0}%)", human_size(saved)));
+    }
+    notice.push_str(&format!(" in {secs:.1}s"));
+    st.notice = notice;
 }
 
 /// Total original bytes vs. total bytes of the smallest written output per finished image.
@@ -1405,6 +1516,18 @@ mod snapshot {
                 for set in [AppWindow::set_webp, AppWindow::set_avif, AppWindow::set_jpeg, AppWindow::set_png, AppWindow::set_resize] {
                     set(ui, true);
                 }
+                a.sync();
+            });
+        }
+        // GIO_SNAPSHOT_RESIZE=<n>: resizing on, with the n-th entry of the resize dropdown.
+        // GIO_SNAPSHOT_CLEAR=1: "Clear images from the list once optimized" on.
+        if var("GIO_SNAPSHOT_CLEAR").is_some() {
+            with_app(|a| a.ui.set_clear_when_done(true));
+        }
+        if let Some(index) = var("GIO_SNAPSHOT_RESIZE").and_then(|v| v.parse::<i32>().ok()) {
+            with_app(|a| {
+                a.ui.set_resize(true);
+                a.ui.set_resize_mode(index);
                 a.sync();
             });
         }

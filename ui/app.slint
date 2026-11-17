@@ -1245,6 +1245,10 @@ export component AppWindow inherits Window {
     in-out property <float> png-level: 2;
     in-out property <bool> resize;
     in-out property <int> resize-mode;
+    // The resize dropdown (labels from Rust), and which entries show the custom fields.
+    in property <[string]> resize-options;
+    in property <int> resize-custom-size;
+    in property <int> resize-custom-percent;
     in-out property <string> limit-width;
     in-out property <string> limit-height;
     in-out property <string> percent;
@@ -1252,6 +1256,7 @@ export component AppWindow inherits Window {
     in-out property <string> output-dir;
     in-out property <bool> skip-larger: true;
     in-out property <bool> overwrite;
+    in-out property <bool> clear-when-done;
 
     // ---- state (written by Rust)
     in property <[TileData]> tiles;
@@ -1458,33 +1463,34 @@ export component AppWindow inherits Window {
                         on <=> root.resize;
                         toggled => { root.settings-changed(); }
                         ComboBox {
-                            model: ["Fit within max size", "75%", "50%", "25%", "Custom percentage"];
+                            model: root.resize-options;
                             current-index <=> root.resize-mode;
                             enabled: root.idle;
                             selected => { root.settings-changed(); }
                         }
-                        if root.resize-mode == 0: NumberRow {
+                        if root.resize-mode == root.resize-custom-size: NumberRow {
                             label: "Max width (px)";
                             value <=> root.limit-width;
                             enabled: root.idle;
                             edited => { root.settings-changed(); }
                         }
-                        if root.resize-mode == 0: NumberRow {
+                        if root.resize-mode == root.resize-custom-size: NumberRow {
                             label: "Max height (px)";
                             value <=> root.limit-height;
                             enabled: root.idle;
                             edited => { root.settings-changed(); }
                         }
-                        if root.resize-mode == 4: NumberRow {
+                        if root.resize-mode == root.resize-custom-percent: NumberRow {
                             label: "Percent";
                             value <=> root.percent;
                             enabled: root.idle;
                             edited => { root.settings-changed(); }
                         }
-                        if root.resize-mode != 0: Text {
+                        if root.resize-hint != "": Text {
                             text: root.resize-hint;
                             color: Ui.secondary;
                             font-size: 12px;
+                            wrap: word-wrap;
                         }
                     }
 
@@ -1529,6 +1535,12 @@ export component AppWindow inherits Window {
                         CheckBox {
                             text: "Overwrite existing files";
                             checked <=> root.overwrite;
+                            enabled: root.idle;
+                            toggled => { root.settings-changed(); }
+                        }
+                        CheckBox {
+                            text: "Clear images from the list once optimized";
+                            checked <=> root.clear-when-done;
                             enabled: root.idle;
                             toggled => { root.settings-changed(); }
                         }
