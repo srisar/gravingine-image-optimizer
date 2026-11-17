@@ -2,6 +2,8 @@
 name = "gravingine_image_optimizer"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/srisar/gravingine-image-optimizer"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -21,6 +23,7 @@ webp = "0.3.1"
 winapi = { version = "0.3.9", features = ["winuser", "wingdi", "windef", "minwindef", "dwmapi", "shobjidl_core", "combaseapi", "objbase", "unknwnbase", "winerror", "wtypesbase"] }
 
 [build-dependencies]
+embed-resource = "3.0.9"
 slint-build = "1.19.0"
 
 [profile.dev.package."*"]

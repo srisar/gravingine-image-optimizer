@@ -1,5 +1,5 @@
-//! Windows-only touches for the Slint window: the app icon (drawn at runtime from the system
-//! icon font, so no image files are shipped), which icon font is installed, and a title bar
+//! Windows-only touches for the Slint window: the app icon (the Gravingine logo, drawn at
+//! runtime at each size Windows asks for), which icon font is installed, and a title bar
 //! tinted to match the window background.
 
 use std::sync::OnceLock;
@@ -10,11 +10,6 @@ use winapi::um::wingdi::*;
 use winapi::um::winuser::*;
 
 type Rgb = (u8, u8, u8);
-
-/// App icon colors: a white photo glyph on an accent-colored plate.
-const ICON_PLATE: Rgb = (0x00, 0x67, 0xC0);
-const WHITE: Rgb = (0xFF, 0xFF, 0xFF);
-const PHOTO: char = '\u{E91B}';
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -53,31 +48,6 @@ unsafe fn create_font(face: &str, height: i32) -> HFONT {
     }
 }
 
-/// Anti-aliased coverage (0..=255) of `glyph` drawn centered in a `size` x `size` box.
-fn glyph_coverage(glyph: char, size: i32, glyph_px: i32) -> Vec<u8> {
-    unsafe {
-        let (dc, bmp, bits) = dib(size);
-        let old_bmp = SelectObject(dc, bmp as _);
-        let font = create_font(icon_font_face(), glyph_px);
-        let old_font = SelectObject(dc, font as _);
-        SetBkMode(dc, TRANSPARENT as i32);
-        SetTextColor(dc, RGB(255, 255, 255));
-        let mut rc = winapi::shared::windef::RECT { left: 0, top: 0, right: size, bottom: size };
-        let mut text = [0u16; 2];
-        let text = glyph.encode_utf16(&mut text);
-        DrawTextW(dc, text.as_ptr(), text.len() as i32, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        GdiFlush();
-        let pixels = std::slice::from_raw_parts(bits, (size * size * 4) as usize);
-        let coverage = pixels.as_chunks::<4>().0.iter().map(|p| p[1]).collect();
-        SelectObject(dc, old_font);
-        DeleteObject(font as _);
-        SelectObject(dc, old_bmp);
-        DeleteObject(bmp as _);
-        DeleteDC(dc);
-        coverage
-    }
-}
-
 /// A zeroed top-down 32-bit DIB section.
 unsafe fn dib(size: i32) -> (winapi::shared::windef::HDC, HBITMAP, *mut u8) {
     unsafe {
@@ -111,35 +81,10 @@ fn icon_from_bgra(size: i32, bgra: &[u8]) -> HICON {
     }
 }
 
-/// The app icon: a white photo glyph on an accent-colored rounded square.
+/// The app icon: the Gravingine logo at the exact pixel size Windows asks for.
 fn app_icon(physical_size: i32) -> HICON {
     let size = physical_size.max(16);
-    let glyph_px = (size as f32 * 0.62).round() as i32;
-    let coverage = glyph_coverage(PHOTO, size, glyph_px);
-    let radius = size as f32 * 0.22;
-    let inset = (size as f32 * 0.03).max(0.5);
-    let mut bgra = Vec::with_capacity((size * size * 4) as usize);
-    for y in 0..size {
-        for x in 0..size {
-            // Anti-aliased rounded-rectangle plate (signed distance, 1px feather).
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let half = size as f32 / 2.0 - inset;
-            let c = size as f32 / 2.0;
-            let qx = (fx - c).abs() - (half - radius);
-            let qy = (fy - c).abs() - (half - radius);
-            let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - radius;
-            let plate = (0.5 - outside).clamp(0.0, 1.0);
-            let g = coverage[(y * size + x) as usize] as f32 / 255.0;
-            let mix = |f: u8, b: u8| (f as f32 * g + b as f32 * (1.0 - g)).round() as u8;
-            bgra.extend_from_slice(&[
-                mix(WHITE.2, ICON_PLATE.2),
-                mix(WHITE.1, ICON_PLATE.1),
-                mix(WHITE.0, ICON_PLATE.0),
-                (plate * 255.0).round() as u8,
-            ]);
-        }
-    }
-    icon_from_bgra(size, &bgra)
+    icon_from_bgra(size, &crate::logo::logo_bgra(size as u32))
 }
 
 /// Set the window's title bar / taskbar / Alt+Tab icons.
@@ -168,3 +113,4 @@ pub fn tint_title_bar(hwnd: HWND, dark: bool, bg: Rgb, fg: Rgb) {
         set(DWMWA_TEXT_COLOR, colorref(fg));
     }
 }
+

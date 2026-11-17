@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # Build the optimized Windows binary and package it for a GitHub release.
 #
-#   scripts/build-release.sh              # test, build, package into dist/
-#   scripts/build-release.sh --skip-tests # build and package only
+#   scripts/build-release.sh                       # test, build, zip and installer into dist/
+#   scripts/build-release.sh --skip-tests          # build and package only
+#   scripts/build-release.sh --require-installer   # fail (instead of skipping the installer)
+#                                                  # when Inno Setup isn't installed
 #
 # Output (version from Cargo.toml):
-#   dist/gravingine-image-optimizer-v<version>-windows-x64.zip
-#   dist/gravingine-image-optimizer-v<version>-windows-x64.zip.sha256
+#   dist/gravingine-image-optimizer-v<version>-windows-x64.zip          portable: exe, README, LICENSE
+#   dist/gravingine-image-optimizer-v<version>-windows-x64-setup.exe    installer (Inno Setup 6)
+#   a .sha256 checksum next to each
+#
+# The installer needs Inno Setup 6 (ISCC.exe): on PATH, in $ISCC, or in its default per-user
+# or all-users install folder (winget install JRSoftware.InnoSetup).
 #
 # Runs in Git Bash on Windows (locally and on GitHub's windows runners).
 set -euo pipefail
@@ -14,9 +20,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 skip_tests=false
+require_installer=false
 for arg in "$@"; do
     case "$arg" in
         --skip-tests) skip_tests=true ;;
+        --require-installer) require_installer=true ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -37,17 +45,58 @@ fi
 echo "==> Building release binary"
 cargo build --release --locked
 
-echo "==> Packaging ${name}.zip"
+echo "==> Staging files"
 rm -rf dist
-mkdir -p "dist/${name}"
-cp target/release/gravingine_image_optimizer.exe "dist/${name}/gravingine-image-optimizer.exe"
-cp README.md "dist/${name}/README.md"
+stage="dist/${name}"
+mkdir -p "$stage"
+cp target/release/gravingine_image_optimizer.exe "$stage/gravingine-image-optimizer.exe"
+cp README.md "$stage/README.md"
+cp LICENSE "$stage/LICENSE.txt"
+
+echo "==> Packaging ${name}.zip"
 # Git Bash has no zip; Windows PowerShell's Compress-Archive is always there.
 powershell.exe -NoProfile -NonInteractive -Command \
-    "Compress-Archive -Path 'dist/${name}/*' -DestinationPath 'dist/${name}.zip' -Force"
-rm -rf "dist/${name}"
+    "Compress-Archive -Path '${stage}/*' -DestinationPath 'dist/${name}.zip' -Force"
 
-(cd dist && sha256sum "${name}.zip" > "${name}.zip.sha256")
+# Inno Setup's compiler: $ISCC, PATH, or its default install folders.
+iscc="${ISCC:-}"
+if [ -z "$iscc" ]; then
+    for candidate in \
+        "$(command -v iscc || true)" \
+        "$(command -v ISCC || true)" \
+        "${LOCALAPPDATA:-}/Programs/Inno Setup 6/ISCC.exe" \
+        "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+        "/c/Program Files/Inno Setup 6/ISCC.exe"; do
+        if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+            iscc="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -n "$iscc" ]; then
+    echo "==> Building installer ${name}-setup.exe"
+    # The .ico build.rs generated for the exe (newest build output folder).
+    icon=$(ls -t target/release/build/gravingine_image_optimizer-*/out/app.ico | head -n 1)
+    # Absolute Windows paths: ISCC resolves relative ones against the script's folder.
+    win() { cygpath -wa "$1"; }
+    # Keep Git Bash from rewriting the /D... options as paths.
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" "$iscc" -Q \
+        "/DAppVersion=${version}" \
+        "/DSourceDir=$(win "$stage")" \
+        "/DSetupIcon=$(win "$icon")" \
+        "/DOutputDir=$(win dist)" \
+        "$(win installer/gravingine.iss)"
+elif [ "$require_installer" = true ]; then
+    echo "Inno Setup 6 (ISCC.exe) not found; install it or set ISCC" >&2
+    exit 1
+else
+    echo "==> Skipping the installer: Inno Setup 6 (ISCC.exe) not found"
+fi
+rm -rf "$stage"
+
+echo "==> Checksums"
+(cd dist && for f in *.zip *.exe; do [ -f "$f" ] && sha256sum "$f" > "$f.sha256"; done; true)
 
 echo "==> Done"
 ls -l dist
