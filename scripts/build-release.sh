@@ -76,8 +76,15 @@ fi
 
 if [ -n "$iscc" ]; then
     echo "==> Building installer ${name}-setup.exe"
-    # The .ico build.rs generated for the exe (newest build output folder).
-    icon=$(ls -t target/release/build/gravingine_image_optimizer-*/out/app.ico | head -n 1)
+    # The .ico build.rs generated for the exe: the newest one under the release build folder.
+    # (Searched by name: Cargo's folder layout differs between versions, e.g.
+    # build/gravingine_image_optimizer-<hash>/out and build/gravingine_image_optimizer/<hash>/out.)
+    icon=$(find target/release/build -path '*gravingine_image_optimizer*' -name app.ico -printf '%T@ %p\n' \
+        | sort -n | tail -n 1 | cut -d' ' -f2-)
+    if [ -z "$icon" ]; then
+        echo "build.rs didn't generate app.ico under target/release/build" >&2
+        exit 1
+    fi
     # Absolute Windows paths: ISCC resolves relative ones against the script's folder.
     win() { cygpath -wa "$1"; }
     # Keep Git Bash from rewriting the /D... options as paths.
