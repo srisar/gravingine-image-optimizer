@@ -8,6 +8,7 @@ smaller files.
 
 - **Drag & drop** files or folders onto the window (or onto the `.exe` icon), or use *Add files* / *Add folder*.
 - Folders are scanned recursively; the folder structure is preserved in the output.
+- **Presets** (top of the settings): Web, Smallest, Photos, Thumbnails, Lossless and Email set the output formats, their quality and resizing in one click. Change anything and the preset shows *Custom*; *Save as preset…* keeps your own (stored in `%APPDATA%\Gravingine Image Optimizer\presets.json`), which can be deleted again. Presets leave *Save to* as it is.
 - **Output formats** (any combination, all encoded in one pass):
   | Format | Encoder | Notes |
   |---|---|---|
@@ -100,6 +101,7 @@ may warn on first launch.
 - `ui/app.slint` – the whole window: settings cards, file list tiles, toolbar and footer (compiled by `build.rs` with the Cosmic style)
 - `src/app.rs` – app state and behavior: adding images, thumbnails, selection, runs, window events
 - `src/optimizer.rs` – decoding, resizing and encoding
+- `src/presets.rs` – settings presets: the built-in ones, matching settings to a preset, and the user's own in `presets.json`
 - `src/taskbar.rs` – taskbar button progress and flash
 - `src/logo.rs` – draws the Gravingine logo: the window icon, and (via `build.rs`) the exe's embedded `.ico`
 - `src/winicon.rs` – sets the window icon, icon-font detection and title bar tint (Win32)
@@ -119,6 +121,9 @@ GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_MIDRUN=300 cargo run -- 
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_ALL_ON=1 cargo run   # switch every format and resizing on first
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RESIZE=2 cargo run -- "D:\Photos"   # resizing on, with the 3rd resize choice (Medium)
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_CLEAR=1 cargo run -- "D:\Photos"   # optimize with "Clear images ... once optimized" on
+GIO_SNAPSHOT=window.png GIO_SNAPSHOT_PRESET=0 cargo run -- "D:\Photos"   # apply the first preset (Web)
+GIO_SNAPSHOT=window.png GIO_SNAPSHOT_PRESET_DIALOG=1 cargo run   # the "Save as preset" dialog
+GIO_SNAPSHOT=window.png GIO_SNAPSHOT_SAVE_PRESET="My blog" cargo run   # save the settings as a preset (not written to disk)
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_COMPARE=0 cargo run -- "D:\Photos"   # run, then open the comparison for the first image
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_COMPARE=0 GIO_SNAPSHOT_ZOOM=100 GIO_SNAPSHOT_SPLIT=0.3 cargo run -- "D:\Photos"   # ...at 100% (or 25, 50, 75), line at 30%
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_ALL_ON=1 GIO_SNAPSHOT_COMPARE=0 GIO_SNAPSHOT_COMPARE_FORMAT=2 cargo run -- "D:\Photos"   # live preview of the AVIF (3rd format chip)

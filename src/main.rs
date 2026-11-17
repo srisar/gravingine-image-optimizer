@@ -5,6 +5,7 @@ slint::include_modules!();
 mod app;
 mod logo;
 mod optimizer;
+mod presets;
 mod taskbar;
 mod winicon;
 
