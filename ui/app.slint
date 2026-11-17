@@ -1,0 +1,865 @@
+// Gravingine Image Optimizer: the whole window, built on Slint's Cosmic widget style.
+// Colors come from the style's Palette (which follows Windows' light/dark mode and tints its
+// accent from the Windows accent color); icons are glyphs from the Windows icon font.
+
+import { CheckBox, ComboBox, LineEdit, ListView, Palette, ProgressIndicator, ScrollView, Slider, Switch } from "std-widgets.slint";
+
+export global Ui {
+    // "Segoe Fluent Icons" on Windows 11, "Segoe MDL2 Assets" on Windows 10 (set from Rust).
+    in property <string> icon-font: "Segoe Fluent Icons";
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    out property <brush> secondary: Palette.foreground.with-alpha(0.68);
+    out property <brush> tertiary: Palette.foreground.with-alpha(0.48);
+    out property <brush> card: Palette.alternate-background;
+    out property <brush> card-border: Palette.border;
+    out property <brush> tint: Palette.accent-background.with-alpha(dark ? 0.20 : 0.14);
+    out property <color> success: dark ? #6CCB5F : #0F7B0F;
+    out property <color> caution: dark ? #FCE100 : #9D5D00;
+    out property <color> critical: dark ? #FF99A4 : #C42B1C;
+}
+
+// Glyphs shared by Segoe Fluent Icons and Segoe MDL2 Assets.
+export global Glyph {
+    out property <string> add-files: "\u{E8E5}";
+    out property <string> add-folder: "\u{E8F4}";
+    out property <string> clear: "\u{E74D}";
+    out property <string> optimize: "\u{E945}";
+    out property <string> cancel: "\u{E711}";
+    out property <string> open-folder: "\u{ED25}";
+    out property <string> browse: "\u{E8DA}";
+    out property <string> photo: "\u{EB9F}";
+    out property <string> drop: "\u{E898}";
+    out property <string> done: "\u{E73E}";
+    out property <string> running: "\u{E895}";
+    out property <string> skipped: "\u{E7BA}";
+    out property <string> error: "\u{EA39}";
+    out property <string> select-all: "\u{E8B3}";
+    out property <string> select-none: "\u{E8E6}";
+    out property <string> webp: "\u{E774}";
+    out property <string> avif: "\u{E734}";
+    out property <string> jpeg: "\u{EB9F}";
+    out property <string> png: "\u{E790}";
+    out property <string> resize: "\u{E740}";
+    out property <string> save: "\u{E74E}";
+}
+
+// One image in the list. tone: 0 normal, 1 success, 2 caution, 3 critical.
+// badge: 0 none, 1 done, 2 running, 3 skipped, 4 error.
+export struct TileData {
+    name: string,
+    details: string,
+    output: string,
+    location: string,
+    tone: int,
+    badge: int,
+    running: bool,
+    selected: bool,
+    thumb: image,
+    has-thumb: bool,
+    // Original / Output columns. out-resized: the output is smaller than the original
+    // (accent color). out-tone: 0 not yet, 1 saved, 2 skipped, 3 failed.
+    orig-dims: string,
+    orig-size: string,
+    out-dims: string,
+    out-resized: bool,
+    out-size: string,
+    out-tone: int,
+}
+
+component Icon inherits Text {
+    in property <string> glyph;
+    text: root.glyph;
+    font-family: Ui.icon-font;
+    font-size: 16px;
+    color: Palette.foreground;
+    horizontal-alignment: center;
+    vertical-alignment: center;
+    accessible-role: none;
+}
+
+// A Cosmic-looking button with an icon-font glyph before its text.
+component GlyphButton {
+    in property <string> glyph;
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    private property <brush> fg: root.primary ? Palette.accent-foreground : Palette.control-foreground;
+
+    min-height: 34px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    opacity: root.enabled ? 1 : 0.45;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+
+    background := Rectangle {
+        border-radius: 17px;
+        background: root.primary ? Palette.accent-background : Palette.control-background;
+        animate background { duration: 150ms; }
+
+        HorizontalLayout {
+            padding-left: root.text == "" ? 9px : 14px;
+            padding-right: root.text == "" ? 9px : 16px;
+            spacing: 8px;
+            alignment: center;
+            Icon {
+                glyph: root.glyph;
+                color: root.fg;
+                font-size: 15px;
+            }
+            if root.text != "": Text {
+                text: root.text;
+                color: root.fg;
+                font-weight: root.primary ? 600 : 400;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    overlay := Rectangle {
+        border-radius: background.border-radius;
+        background: touch.pressed ? #00000030 : touch.has-hover ? #63636333 : transparent;
+        animate background { duration: 100ms; }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component SectionHeading inherits Text {
+    font-size: 15px;
+    font-weight: 600;
+    color: Palette.foreground;
+}
+
+// A setting card: tinted icon tile, title, description and a switch. Its contents slide
+// open below a divider while it is switched on.
+component SettingCard inherits Rectangle {
+    in property <string> glyph;
+    in property <string> title;
+    in property <string> description;
+    in property <bool> enabled: true;
+    // Cards without a switch (e.g. "Save to") are always open.
+    in property <bool> switchable: true;
+    // Left inset of the card contents (level with the icon tile by default).
+    in property <length> indent: 12px;
+    in-out property <bool> on: true;
+    callback toggled;
+
+    private property <bool> open: !root.switchable || root.on;
+
+    background: Ui.card;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Ui.card-border;
+    clip: true;
+
+    VerticalLayout {
+        HorizontalLayout {
+            padding: 12px;
+            spacing: 12px;
+            VerticalLayout {
+                alignment: center;
+            Rectangle {
+                width: 36px;
+                height: 36px;
+                border-radius: 9px;
+                background: Ui.tint;
+                Icon {
+                    glyph: root.glyph;
+                    color: Palette.accent-background;
+                    font-size: 18px;
+                }
+            }
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 1px;
+                Text {
+                    text: root.title;
+                    font-size: 14px;
+                    font-weight: 600;
+                    color: Palette.foreground;
+                    overflow: elide;
+                }
+                if root.description != "": Text {
+                    text: root.description;
+                    font-size: 12px;
+                    color: Ui.secondary;
+                    overflow: elide;
+                }
+            }
+            if root.switchable: VerticalLayout {
+                alignment: center;
+                Switch {
+                    checked <=> root.on;
+                    enabled: root.enabled;
+                    accessible-label: root.title;
+                    toggled => { root.toggled(); }
+                }
+            }
+        }
+        body := Rectangle {
+            height: root.open ? inner.preferred-height : 0px;
+            clip: true;
+            animate height { duration: 180ms; easing: ease-in-out; }
+            inner := VerticalLayout {
+                y: 0;
+                height: self.preferred-height;
+                Rectangle {
+                    height: 1px;
+                    background: Ui.card-border;
+                }
+                VerticalLayout {
+                    padding-left: root.indent;
+                    padding-right: 12px;
+                    padding-top: 10px;
+                    padding-bottom: 12px;
+                    spacing: 8px;
+                    @children
+                }
+            }
+        }
+    }
+}
+
+component SliderRow {
+    in property <string> label;
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
+    in property <bool> enabled: true;
+    in-out property <float> value;
+    callback changed;
+
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: root.label;
+            width: 56px;
+            vertical-alignment: center;
+            color: root.enabled ? Palette.foreground : Ui.tertiary;
+        }
+        Slider {
+            minimum: root.minimum;
+            maximum: root.maximum;
+            step: 1;
+            value <=> root.value;
+            enabled: root.enabled;
+            changed(v) => { root.changed(); }
+        }
+        Text {
+            text: Math.round(root.value);
+            width: 28px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            color: root.enabled ? Palette.foreground : Ui.tertiary;
+        }
+    }
+}
+
+component SwitchRow {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in-out property <bool> checked;
+    callback toggled;
+
+    HorizontalLayout {
+        Text {
+            text: root.label;
+            vertical-alignment: center;
+            color: root.enabled ? Palette.foreground : Ui.tertiary;
+        }
+        Switch {
+            checked <=> root.checked;
+            enabled: root.enabled;
+            accessible-label: root.label;
+            toggled => { root.toggled(); }
+        }
+    }
+}
+
+component NumberRow {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in-out property <string> value;
+    callback edited;
+
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: root.label;
+            vertical-alignment: center;
+            color: root.enabled ? Palette.foreground : Ui.tertiary;
+        }
+        LineEdit {
+            width: 96px;
+            text <=> root.value;
+            enabled: root.enabled;
+            input-type: number;
+            horizontal-alignment: right;
+            edited => { root.edited(); }
+        }
+    }
+}
+
+// One image: checkbox, thumbnail with a status badge, name and three lines of details.
+// A right-aligned figure in a tile's Original / Output columns.
+// role: 0 column label, 1 dimensions, 2 file size.
+component TileFigure inherits Text {
+    in property <int> role;
+    width: 104px;
+    horizontal-alignment: right;
+    font-size: root.role == 1 ? 15px : root.role == 0 ? 11px : 12px;
+    font-weight: root.role == 1 ? 600 : 400;
+    color: root.role == 0 ? Ui.tertiary : root.role == 1 ? Palette.foreground : Ui.secondary;
+    overflow: elide;
+}
+
+component Tile inherits Rectangle {
+    in property <TileData> data;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+
+    private property <color> tone-color: data.tone == 1 ? Ui.success : data.tone == 2 ? Ui.caution : data.tone == 3 ? Ui.critical : Palette.foreground;
+
+    height: 92px;
+    border-radius: 10px;
+    background: touch.has-hover ? Palette.control-background : transparent;
+    animate background { duration: 120ms; }
+    opacity: data.selected || data.running ? 1 : 0.62;
+
+    HorizontalLayout {
+        padding: 10px;
+        padding-left: 8px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            CheckBox {
+                checked: data.selected;
+                enabled: root.enabled;
+                accessible-label: data.name;
+                toggled => { root.toggled(self.checked); }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+        Rectangle {
+            width: 72px;
+            height: 72px;
+            thumb := Rectangle {
+                border-radius: 8px;
+                clip: true;
+                background: Ui.tint;
+                if data.has-thumb: Image {
+                    width: 100%;
+                    height: 100%;
+                    source: data.thumb;
+                    image-fit: cover;
+                }
+                if !data.has-thumb: Icon {
+                    glyph: Glyph.photo;
+                    color: Palette.accent-background;
+                    font-size: 26px;
+                }
+            }
+            if data.badge != 0: Rectangle {
+                x: parent.width - self.width + 5px;
+                y: parent.height - self.height + 5px;
+                width: 24px;
+                height: 24px;
+                border-radius: 12px;
+                background: Ui.card;
+                border-width: 1px;
+                border-color: Ui.card-border;
+                Icon {
+                    glyph: data.badge == 1 ? Glyph.done : data.badge == 2 ? Glyph.running : data.badge == 3 ? Glyph.skipped : Glyph.error;
+                    color: data.badge == 2 ? Palette.accent-background : root.tone-color;
+                    font-size: 13px;
+                }
+            }
+        }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: data.name;
+                font-size: 14px;
+                font-weight: 600;
+                color: Palette.foreground;
+                overflow: elide;
+            }
+            Text {
+                text: data.details;
+                font-size: 12px;
+                color: Ui.secondary;
+                overflow: elide;
+            }
+            if !data.running: Text {
+                text: data.output;
+                font-size: 12px;
+                color: data.tone == 0 ? Palette.foreground : root.tone-color;
+                overflow: elide;
+            }
+            if data.running: VerticalLayout {
+                padding-top: 6px;
+                padding-bottom: 5px;
+                padding-right: 40px;
+                ProgressIndicator {
+                    height: 4px;
+                    indeterminate: true;
+                }
+            }
+            Text {
+                text: data.location;
+                font-size: 12px;
+                color: data.tone == 3 ? Ui.critical : Ui.tertiary;
+                overflow: elide;
+            }
+        }
+        // Original / Output: dimensions and file size, in fixed-width columns so they line
+        // up from tile to tile.
+        VerticalLayout {
+            alignment: center;
+            padding-right: 6px;
+            GridLayout {
+                spacing-horizontal: 16px;
+                spacing-vertical: 1px;
+                Row {
+                    TileFigure { text: "Original"; role: 0; }
+                    TileFigure { text: "Output"; role: 0; }
+                }
+                Row {
+                    TileFigure { text: data.orig-dims; role: 1; }
+                    TileFigure {
+                        text: data.out-dims;
+                        role: 1;
+                        color: data.out-resized ? Palette.accent-background : Ui.tertiary;
+                    }
+                }
+                Row {
+                    TileFigure { text: data.orig-size; role: 2; }
+                    TileFigure {
+                        text: data.out-size;
+                        role: 2;
+                        color: data.out-tone == 1 ? Ui.success : data.out-tone == 2 ? Ui.caution : data.out-tone == 3 ? Ui.critical : Ui.tertiary;
+                    }
+                }
+            }
+        }
+    }
+
+    // On top of everything, the checkbox included: clicking anywhere on the tile toggles it.
+    // (The checkbox only shows the state, so it always follows the model, e.g. Select all.)
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.toggled(!data.selected); }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Gravingine Image Optimizer";
+    preferred-width: 1180px;
+    preferred-height: 800px;
+    min-width: 820px;
+    min-height: 560px;
+    background: Palette.background;
+    default-font-size: 13px;
+
+    // ---- settings (read and written by Rust)
+    in-out property <bool> webp;
+    in-out property <float> webp-quality: 80;
+    in-out property <bool> webp-lossless;
+    in-out property <bool> avif;
+    in-out property <float> avif-quality: 60;
+    in-out property <float> avif-speed: 6;
+    in-out property <bool> jpeg;
+    in-out property <float> jpeg-quality: 80;
+    in-out property <bool> png;
+    in-out property <float> png-level: 2;
+    in-out property <bool> resize;
+    in-out property <int> resize-mode;
+    in-out property <string> limit-width;
+    in-out property <string> limit-height;
+    in-out property <string> percent;
+    in-out property <int> save-mode;
+    in-out property <string> output-dir;
+    in-out property <bool> skip-larger: true;
+    in-out property <bool> overwrite;
+
+    // ---- state (written by Rust)
+    in property <[TileData]> tiles;
+    in property <bool> running;
+    in property <bool> drag-hover;
+    in property <string> status: "Add images to get started.";
+    in property <float> progress;
+    in property <string> optimize-label: "Optimize";
+    in property <bool> can-optimize;
+    in property <bool> can-clear;
+    in property <bool> can-select-all;
+    in property <bool> can-select-none;
+    in property <bool> has-output;
+    in property <string> resize-hint;
+
+    callback add-files;
+    callback add-folder;
+    callback clear-all;
+    callback select-all;
+    callback select-none;
+    callback browse;
+    callback optimize;
+    callback cancel;
+    callback open-output;
+    callback settings-changed;
+    callback tile-toggled(int, bool);
+
+    // Force light or dark instead of following Windows (testing).
+    public function set-dark(dark: bool) {
+        Palette.color-scheme = dark ? ColorScheme.dark : ColorScheme.light;
+    }
+
+    private property <bool> idle: !root.running;
+
+    HorizontalLayout {
+        padding: 16px;
+        padding-bottom: 0px;
+        spacing: 20px;
+
+        // ------------------------------------------------ left: toolbar and settings
+        VerticalLayout {
+            width: 330px;
+            spacing: 12px;
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                GlyphButton {
+                    glyph: Glyph.add-files;
+                    text: "Add files…";
+                    enabled: root.idle;
+                    clicked => { root.add-files(); }
+                }
+                GlyphButton {
+                    glyph: Glyph.add-folder;
+                    text: "Add folder…";
+                    enabled: root.idle;
+                    clicked => { root.add-folder(); }
+                }
+                GlyphButton {
+                    glyph: Glyph.clear;
+                    text: "Clear";
+                    enabled: root.can-clear;
+                    clicked => { root.clear-all(); }
+                }
+            }
+
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    // Stack from the top: extra height stays empty instead of stretching the cards.
+                    alignment: start;
+                    padding-right: 14px;
+                    padding-bottom: 16px;
+                    spacing: 8px;
+
+                    SectionHeading { text: "Output formats"; }
+                    SettingCard {
+                        glyph: Glyph.webp;
+                        title: "WebP";
+                        description: "Small files, keeps transparency";
+                        enabled: root.idle;
+                        on <=> root.webp;
+                        toggled => { root.settings-changed(); }
+                        SliderRow {
+                            label: "Quality";
+                            minimum: 1;
+                            maximum: 100;
+                            value <=> root.webp-quality;
+                            enabled: root.idle && !root.webp-lossless;
+                            changed => { root.settings-changed(); }
+                        }
+                        SwitchRow {
+                            label: "Lossless";
+                            checked <=> root.webp-lossless;
+                            enabled: root.idle;
+                            toggled => { root.settings-changed(); }
+                        }
+                    }
+                    SettingCard {
+                        glyph: Glyph.avif;
+                        title: "AVIF";
+                        description: "Smallest files, slower to encode";
+                        enabled: root.idle;
+                        on <=> root.avif;
+                        toggled => { root.settings-changed(); }
+                        SliderRow {
+                            label: "Quality";
+                            minimum: 1;
+                            maximum: 100;
+                            value <=> root.avif-quality;
+                            enabled: root.idle;
+                            changed => { root.settings-changed(); }
+                        }
+                        SliderRow {
+                            label: "Speed";
+                            minimum: 1;
+                            maximum: 10;
+                            value <=> root.avif-speed;
+                            enabled: root.idle;
+                            changed => { root.settings-changed(); }
+                        }
+                    }
+                    SettingCard {
+                        glyph: Glyph.jpeg;
+                        title: "JPEG";
+                        description: "Works everywhere";
+                        enabled: root.idle;
+                        on <=> root.jpeg;
+                        toggled => { root.settings-changed(); }
+                        SliderRow {
+                            label: "Quality";
+                            minimum: 1;
+                            maximum: 100;
+                            value <=> root.jpeg-quality;
+                            enabled: root.idle;
+                            changed => { root.settings-changed(); }
+                        }
+                    }
+                    SettingCard {
+                        glyph: Glyph.png;
+                        title: "PNG";
+                        description: "Lossless, for logos and icons";
+                        enabled: root.idle;
+                        on <=> root.png;
+                        toggled => { root.settings-changed(); }
+                        SliderRow {
+                            label: "Effort";
+                            minimum: 0;
+                            maximum: 6;
+                            value <=> root.png-level;
+                            enabled: root.idle;
+                            changed => { root.settings-changed(); }
+                        }
+                    }
+
+                    Rectangle { height: 4px; }
+                    SectionHeading { text: "Image size"; }
+                    SettingCard {
+                        glyph: Glyph.resize;
+                        title: "Resize images";
+                        description: "Shrinks large images";
+                        enabled: root.idle;
+                        on <=> root.resize;
+                        toggled => { root.settings-changed(); }
+                        ComboBox {
+                            model: ["Fit within max size", "75%", "50%", "25%", "Custom percentage"];
+                            current-index <=> root.resize-mode;
+                            enabled: root.idle;
+                            selected => { root.settings-changed(); }
+                        }
+                        if root.resize-mode == 0: NumberRow {
+                            label: "Max width (px)";
+                            value <=> root.limit-width;
+                            enabled: root.idle;
+                            edited => { root.settings-changed(); }
+                        }
+                        if root.resize-mode == 0: NumberRow {
+                            label: "Max height (px)";
+                            value <=> root.limit-height;
+                            enabled: root.idle;
+                            edited => { root.settings-changed(); }
+                        }
+                        if root.resize-mode == 4: NumberRow {
+                            label: "Percent";
+                            value <=> root.percent;
+                            enabled: root.idle;
+                            edited => { root.settings-changed(); }
+                        }
+                        if root.resize-mode != 0: Text {
+                            text: root.resize-hint;
+                            color: Ui.secondary;
+                            font-size: 12px;
+                        }
+                    }
+
+                    Rectangle { height: 4px; }
+                    SectionHeading { text: "Save to"; }
+                    SettingCard {
+                        glyph: Glyph.save;
+                        title: "Output folder";
+                        switchable: false;
+                        ComboBox {
+                            model: ["\"optimized\" folder next to images", "Custom folder"];
+                            current-index <=> root.save-mode;
+                            enabled: root.idle;
+                            selected => {
+                                if (root.save-mode == 1 && root.output-dir == "") {
+                                    root.browse();
+                                }
+                                root.settings-changed();
+                            }
+                        }
+                        if root.save-mode == 1: HorizontalLayout {
+                            spacing: 6px;
+                            LineEdit {
+                                text <=> root.output-dir;
+                                placeholder-text: "Choose a folder";
+                                enabled: root.idle;
+                                edited => { root.settings-changed(); }
+                            }
+                            GlyphButton {
+                                glyph: Glyph.browse;
+                                enabled: root.idle;
+                                accessible-label: "Browse";
+                                clicked => { root.browse(); }
+                            }
+                        }
+                        CheckBox {
+                            text: "Skip files larger than the original";
+                            checked <=> root.skip-larger;
+                            enabled: root.idle;
+                            toggled => { root.settings-changed(); }
+                        }
+                        CheckBox {
+                            text: "Overwrite existing files";
+                            checked <=> root.overwrite;
+                            enabled: root.idle;
+                            toggled => { root.settings-changed(); }
+                        }
+                    }
+
+                    Text {
+                        text: "Metadata (EXIF, GPS) is removed and photo orientation is applied.";
+                        wrap: word-wrap;
+                        font-size: 12px;
+                        color: Ui.tertiary;
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------------ right: list and footer
+        VerticalLayout {
+            spacing: 12px;
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                GlyphButton {
+                    glyph: Glyph.select-all;
+                    text: "Select all";
+                    enabled: root.can-select-all;
+                    clicked => { root.select-all(); }
+                }
+                GlyphButton {
+                    glyph: Glyph.select-none;
+                    text: "Select none";
+                    enabled: root.can-select-none;
+                    clicked => { root.select-none(); }
+                }
+            }
+
+            Rectangle {
+                vertical-stretch: 1;
+                border-radius: 14px;
+                background: Ui.card;
+                border-width: root.drag-hover ? 2px : 1px;
+                border-color: root.drag-hover ? Palette.accent-background : Ui.card-border;
+                clip: true;
+
+                if root.tiles.length > 0: ListView {
+                    x: 6px;
+                    y: 6px;
+                    width: parent.width - 12px;
+                    height: parent.height - 12px;
+                    for tile[i] in root.tiles: Tile {
+                        data: tile;
+                        enabled: root.idle;
+                        toggled(on) => { root.tile-toggled(i, on); }
+                    }
+                }
+
+                if root.tiles.length == 0: VerticalLayout {
+                    alignment: center;
+                    spacing: 6px;
+                    Icon {
+                        glyph: Glyph.drop;
+                        font-size: 48px;
+                        color: Palette.accent-background;
+                        height: 64px;
+                    }
+                    Text {
+                        text: root.drag-hover ? "Release to add images" : "Drop images or folders here";
+                        font-size: 20px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        color: Palette.foreground;
+                    }
+                    Text {
+                        text: "or use Add files… or Add folder…";
+                        horizontal-alignment: center;
+                        color: Ui.secondary;
+                    }
+                    Text {
+                        text: "JPG · PNG · WebP · GIF · BMP · TIFF · ICO";
+                        horizontal-alignment: center;
+                        font-size: 12px;
+                        color: Ui.tertiary;
+                    }
+                }
+            }
+
+            // Footer: Optimize / Cancel, status and progress, Open output folder.
+            HorizontalLayout {
+                height: 60px;
+                spacing: 14px;
+                padding-bottom: 12px;
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    if root.idle: GlyphButton {
+                        glyph: Glyph.optimize;
+                        text: root.optimize-label;
+                        primary: true;
+                        enabled: root.can-optimize;
+                        clicked => { root.optimize(); }
+                    }
+                    if root.running: GlyphButton {
+                        glyph: Glyph.cancel;
+                        text: "Cancel";
+                        clicked => { root.cancel(); }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 6px;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: root.status;
+                        color: Palette.foreground;
+                        overflow: elide;
+                    }
+                    if root.running: ProgressIndicator {
+                        width: 220px;
+                        height: 4px;
+                        progress: root.progress;
+                    }
+                }
+                if root.idle && root.has-output: VerticalLayout {
+                    alignment: center;
+                    GlyphButton {
+                        glyph: Glyph.open-folder;
+                        text: "Open output folder";
+                        clicked => { root.open-output(); }
+                    }
+                }
+            }
+        }
+    }
+}

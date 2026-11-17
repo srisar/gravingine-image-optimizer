@@ -245,25 +245,49 @@ fn write_output(path: &Path, data: &[u8], overwrite: bool) -> Result<PathBuf> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let path = if overwrite || !path.exists() { path.to_path_buf() } else { unique_path(path) };
-    fs::write(&path, data).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+    // Always create a fresh file (never write through an existing file or symlink at the
+    // output path). Overwriting replaces the existing entry; otherwise a number is added.
+    if overwrite
+        && let Ok(meta) = fs::symlink_metadata(path)
+        && !meta.is_dir()
+    {
+        fs::remove_file(path).with_context(|| format!("replacing {}", path.display()))?;
+    }
+    // Try the name itself, then (when not overwriting) "name-1", "name-2", … Each attempt is
+    // the atomic create itself, so anything already there (even a broken link) is skipped.
+    let attempts = if overwrite { 1 } else { MAX_NUMBERED_NAMES };
+    for candidate in std::iter::once(path.to_path_buf()).chain(numbered_paths(path)).take(attempts) {
+        match fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(data).with_context(|| format!("writing {}", candidate.display()))?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && !overwrite => continue,
+            Err(e) => return Err(e).with_context(|| format!("writing {}", candidate.display())),
+        }
+    }
+    bail!("no free file name for {}", path.display())
 }
 
-fn unique_path(path: &Path) -> PathBuf {
+/// How many numbered alternatives ("name-1" … ) to try before giving up.
+const MAX_NUMBERED_NAMES: usize = 10_000;
+
+/// "dir/name-1.ext", "dir/name-2.ext", …
+fn numbered_paths(path: &Path) -> impl Iterator<Item = PathBuf> + '_ {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let ext = path.extension().unwrap_or_default().to_string_lossy();
     let dir = path.parent().unwrap_or(Path::new(""));
-    (1..)
-        .map(|i| dir.join(format!("{stem}-{i}.{ext}")))
-        .find(|p| !p.exists())
-        .expect("infinite iterator")
+    (1..).map(move |i| dir.join(format!("{stem}-{i}.{ext}")))
 }
 
 /// A small preview of a source image for the file list.
 pub struct Thumbnail {
-    /// `size` x `size` BGRA pixels (straight alpha), image centered with transparent padding.
-    pub bgra: Vec<u8>,
+    /// `size` x `size` RGBA pixels (straight alpha): the image scaled to cover the square,
+    /// center-cropped.
+    pub rgba: Vec<u8>,
+    /// Side of the square, in pixels.
+    pub size: u32,
     /// Dimensions of the full image (after applying its orientation).
     pub width: u32,
     pub height: u32,
@@ -284,14 +308,8 @@ pub fn thumbnail(path: &Path, size: u32) -> Result<Thumbnail> {
     };
     let img = decode(&bytes)?;
     let (width, height) = (img.width(), img.height());
-    let small = img.thumbnail(size, size).to_rgba8();
-    let (ox, oy) = ((size - small.width()) / 2, (size - small.height()) / 2);
-    let mut bgra = vec![0u8; (size * size * 4) as usize];
-    for (x, y, p) in small.enumerate_pixels() {
-        let i = (((y + oy) * size + x + ox) * 4) as usize;
-        bgra[i..i + 4].copy_from_slice(&[p[2], p[1], p[0], p[3]]);
-    }
-    Ok(Thumbnail { bgra, width, height, format })
+    let small = img.resize_to_fill(size, size, FilterType::Triangle).to_rgba8();
+    Ok(Thumbnail { size: small.width(), rgba: small.into_raw(), width, height, format })
 }
 
 fn decode(bytes: &[u8]) -> Result<DynamicImage> {
@@ -457,6 +475,23 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn write_output_numbers_or_replaces() {
+        let dir = temp_dir("write");
+        let target = dir.join("out").join("a.webp");
+        assert_eq!(write_output(&target, b"one", false).unwrap(), target);
+        // Not overwriting: a numbered name, the original untouched.
+        let second = write_output(&target, b"two", false).unwrap();
+        assert_eq!(second, dir.join("out").join("a-1.webp"));
+        assert_eq!(fs::read(&target).unwrap(), b"one");
+        // Taken numbered names are skipped too.
+        assert_eq!(write_output(&target, b"two", false).unwrap(), dir.join("out").join("a-2.webp"));
+        // Overwriting: the same name, new contents.
+        assert_eq!(write_output(&target, b"three", true).unwrap(), target);
+        assert_eq!(fs::read(&target).unwrap(), b"three");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn sample_image(alpha: bool) -> DynamicImage {
