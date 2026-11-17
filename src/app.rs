@@ -17,6 +17,7 @@ use winapi::shared::windef::HWND;
 
 use crate::optimizer::{self, Format, FormatResult, OutputLocation, Outcome, ResizeMode, Settings, Source};
 use crate::taskbar::{self, Taskbar};
+use crate::presets::{self, Look, Preset};
 use crate::{AppWindow, CompareFormat, TileData, Ui, winicon};
 
 /// One entry of the resize dropdown.
@@ -236,6 +237,10 @@ pub struct App {
     preview_timer: slint::Timer,
     /// Last comparison load started (unique across comparisons).
     compare_request: Cell<u64>,
+    /// The built-in presets, then the user's own.
+    presets: RefCell<Vec<Preset>>,
+    /// The names in the preset dropdown as last set (so it's only rebuilt when they change).
+    preset_names: RefCell<Vec<String>>,
     // Never hold a borrow while calling into the UI: callbacks can re-enter the app.
     state: RefCell<State>,
 }
@@ -281,6 +286,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
         drop_flush_queued: Cell::new(false),
         preview_timer: slint::Timer::default(),
         compare_request: Cell::new(0),
+        presets: RefCell::new(presets::built_in().into_iter().chain(presets_path().map(|p| presets::load(&p)).unwrap_or_default()).collect()),
+        preset_names: RefCell::new(Vec::new()),
         state: RefCell::new(State::default()),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
@@ -339,6 +346,9 @@ impl App {
         ui.on_open_source(|| open_in_explorer(env!("CARGO_PKG_REPOSITORY")));
         ui.on_open_releases(|| open_in_explorer(concat!(env!("CARGO_PKG_REPOSITORY"), "/releases")));
         ui.on_open_website(|| open_in_explorer("https://gravitide.dev"));
+        ui.on_apply_preset(|i| with_app(|a| a.apply_preset(i as usize)));
+        ui.on_save_preset(|name| with_app(|a| a.save_preset(&name)));
+        ui.on_delete_preset(|| with_app(App::delete_preset));
         ui.window().on_winit_window_event(|_, event| {
             with_app(|a| a.on_window_event(event));
             EventResult::Propagate
@@ -1056,6 +1066,96 @@ impl App {
             }
             .into(),
         );
+        self.sync_preset(&settings);
+    }
+
+    // -------------------------------------------------------------- presets
+
+    /// The preset the current settings match, if any (by index in `presets`).
+    fn matching_preset(&self, settings: &Settings) -> Option<usize> {
+        let look = Look::of(settings);
+        self.presets.borrow().iter().position(|p| p.look.same_as(&look))
+    }
+
+    /// Show which preset the settings match ("Custom" when none), what it does, and whether
+    /// it can be deleted.
+    fn sync_preset(&self, settings: &Settings) {
+        let ui = &self.ui;
+        let current = self.matching_preset(settings);
+        let mut names: Vec<String> = self.presets.borrow().iter().map(|p| p.name.clone()).collect();
+        if current.is_none() {
+            names.push("Custom".into());
+        }
+        if *self.preset_names.borrow() != names {
+            let model: Vec<slint::SharedString> = names.iter().map(|n| n.as_str().into()).collect();
+            ui.set_preset_names(ModelRc::new(VecModel::from(model)));
+            *self.preset_names.borrow_mut() = names.clone();
+        }
+        ui.set_preset_index(current.unwrap_or(names.len() - 1) as i32);
+        ui.set_preset_summary(look_summary(&Look::of(settings)).into());
+        ui.set_preset_deletable(current.is_some_and(|i| !self.presets.borrow()[i].built_in));
+    }
+
+    fn apply_preset(&self, index: usize) {
+        let Some(look) = self.presets.borrow().get(index).map(|p| p.look) else {
+            return; // "Custom": nothing to apply
+        };
+        let mut settings = self.read_settings();
+        look.apply(&mut settings);
+        self.apply_settings(&settings);
+        self.sync();
+    }
+
+    /// Save the current settings as a preset called `name` (replacing a preset of the user's
+    /// with the same name).
+    fn save_preset(&self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.ui.set_preset_error("Type a name for the preset.".into());
+            return;
+        }
+        let look = Look::of(&self.read_settings());
+        {
+            let mut presets = self.presets.borrow_mut();
+            let same = presets.iter().position(|p| p.name.eq_ignore_ascii_case(name));
+            match same {
+                Some(i) if presets[i].built_in => {
+                    drop(presets);
+                    self.ui.set_preset_error(format!("“{name}” is a built-in preset. Choose another name.").into());
+                    return;
+                }
+                Some(i) => presets[i].look = look,
+                None => presets.push(Preset { name: name.into(), look, built_in: false }),
+            }
+        }
+        self.save_presets();
+        self.ui.set_preset_dialog_open(false);
+        self.sync();
+    }
+
+    /// Delete the current preset, if it's one of the user's. The settings stay as they are.
+    fn delete_preset(&self) {
+        let Some(i) = self.matching_preset(&self.read_settings()) else { return };
+        {
+            let mut presets = self.presets.borrow_mut();
+            if presets[i].built_in {
+                return;
+            }
+            presets.remove(i);
+        }
+        self.save_presets();
+        self.sync();
+    }
+
+    fn save_presets(&self) {
+        // Self-snapshot runs never touch the saved presets.
+        #[cfg(any(debug_assertions, feature = "snapshot"))]
+        if std::env::var_os("GIO_SNAPSHOT").is_some() {
+            return;
+        }
+        if let Some(path) = presets_path() {
+            let _ = presets::save(&path, &self.presets.borrow());
+        }
     }
 
     /// The resize dropdown's current choice.
@@ -1433,6 +1533,32 @@ fn run_jobs(work: Vec<(usize, Source)>, settings: Settings, cancel: Arc<AtomicBo
 
 // ------------------------------------------------------------------ settings file
 
+/// "WebP at 80% · HD (1920 × 1080)": what a look produces.
+fn look_summary(look: &Look) -> String {
+    let mut s = Settings::default();
+    look.apply(&mut s);
+    let formats: Vec<String> = s.formats().into_iter().map(|f| format_setting(f, &s)).collect();
+    let formats = if formats.is_empty() { "No output format".to_string() } else { formats.join(", ") };
+    let size = match (s.resize, s.resize_mode) {
+        (false, _) => "original size".to_string(),
+        (true, ResizeMode::Box) => RESIZE_CHOICES
+            .iter()
+            .find(|c| matches!(c, ResizeChoice::Size(_, w, h) if (*w, *h) == (s.box_width, s.box_height)))
+            .map_or_else(|| format!("fit {} × {}", s.box_width, s.box_height), |c| c.label()),
+        (true, ResizeMode::Percent) => format!("reduced to {}%", s.resize_percent),
+        (true, ResizeMode::FitWithin) => {
+            let side = |v: u32| if v == 0 { "any".to_string() } else { v.to_string() };
+            format!("fit {} × {}", side(s.max_width), side(s.max_height))
+        }
+    };
+    format!("{formats} · {size}")
+}
+
+/// The user's own presets, next to the settings.
+fn presets_path() -> Option<PathBuf> {
+    settings_path().map(|p| p.with_file_name("presets.json"))
+}
+
 fn settings_path() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA").map(PathBuf::from)?;
     Some(base.join("Gravingine Image Optimizer").join("settings.json"))
@@ -1517,6 +1643,18 @@ mod snapshot {
             });
         }
         // GIO_SNAPSHOT_RESIZE=<n>: resizing on, with the n-th entry of the resize dropdown.
+        // GIO_SNAPSHOT_PRESET=<n>: apply the n-th preset; GIO_SNAPSHOT_PRESET_DIALOG=1: open
+        // "Save as preset".
+        if let Some(index) = var("GIO_SNAPSHOT_PRESET").and_then(|v| v.parse::<usize>().ok()) {
+            with_app(|a| a.apply_preset(index));
+        }
+        if var("GIO_SNAPSHOT_PRESET_DIALOG").is_some() {
+            with_app(|a| a.ui.set_preset_dialog_open(true));
+        }
+        // GIO_SNAPSHOT_SAVE_PRESET=<name>: save the current settings as a preset (in memory).
+        if let Some(name) = var("GIO_SNAPSHOT_SAVE_PRESET") {
+            with_app(|a| a.save_preset(&name));
+        }
         // GIO_SNAPSHOT_CLEAR=1: "Clear images from the list once optimized" on.
         if var("GIO_SNAPSHOT_CLEAR").is_some() {
             with_app(|a| a.ui.set_clear_when_done(true));

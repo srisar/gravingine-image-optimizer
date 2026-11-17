@@ -46,6 +46,7 @@ export global Glyph {
     out property <string> chevron-right: "\u{E76C}";
     out property <string> info: "\u{E946}";
     out property <string> open-new: "\u{E8A7}";
+    out property <string> preset: "\u{E9E9}";
 }
 
 // One image in the list. tone: 0 normal, 1 success, 2 caution, 3 critical.
@@ -1222,6 +1223,88 @@ component AboutDialog inherits Rectangle {
     }
 }
 
+// "Save as preset": name the current settings. Enter saves, Esc or a click outside cancels.
+component PresetDialog inherits Rectangle {
+    // What will be saved ("WebP at 80% · HD (1920 × 1080)").
+    in property <string> summary;
+    in property <string> error;
+    callback save(string);
+    callback close;
+
+    background: #00000080;
+
+    TouchArea {
+        clicked => { root.close(); }
+        scroll-event(e) => { accept }
+    }
+
+    card := Rectangle {
+        width: min(420px, root.width - 32px);
+        height: content.preferred-height;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        background: Ui.card;
+        border-radius: 16px;
+        border-width: 1px;
+        border-color: Ui.card-border;
+
+        TouchArea { }
+
+        keys := FocusScope {
+            key-pressed(e) => {
+                if (e.text == Key.Escape) {
+                    root.close();
+                    return accept;
+                }
+                reject
+            }
+
+            content := VerticalLayout {
+                padding: 22px;
+                spacing: 12px;
+                Text {
+                    text: "Save as preset";
+                    font-size: 16px;
+                    font-weight: 600;
+                    color: Palette.foreground;
+                }
+                Text {
+                    text: "Saves the output formats, their quality and resizing: " + root.summary;
+                    font-size: 12px;
+                    color: Ui.secondary;
+                    wrap: word-wrap;
+                }
+                name := LineEdit {
+                    placeholder-text: "Preset name";
+                    accepted(text) => { root.save(text); }
+                }
+                if root.error != "": Text {
+                    text: root.error;
+                    font-size: 12px;
+                    color: Ui.critical;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    GlyphButton {
+                        text: "Cancel";
+                        clicked => { root.close(); }
+                    }
+                    GlyphButton {
+                        text: "Save";
+                        primary: true;
+                        enabled: name.text != "";
+                        clicked => { root.save(name.text); }
+                    }
+                }
+            }
+        }
+    }
+
+    init => { name.focus(); }
+}
+
 export component AppWindow inherits Window {
     title: "Gravingine Image Optimizer";
     preferred-width: 1180px;
@@ -1307,6 +1390,18 @@ export component AppWindow inherits Window {
     callback open-source;
     callback open-releases;
     callback open-website;
+
+    // ---- presets (names, current choice and summary written by Rust)
+    in property <[string]> preset-names;
+    in-out property <int> preset-index;
+    in property <string> preset-summary;
+    // The current preset is one of the user's own (so it can be deleted).
+    in property <bool> preset-deletable;
+    in-out property <bool> preset-dialog-open;
+    in-out property <string> preset-error;
+    callback apply-preset(int);
+    callback save-preset(string);
+    callback delete-preset;
     callback compare-close;
 
     callback add-files;
@@ -1369,6 +1464,76 @@ export component AppWindow inherits Window {
                     padding-bottom: 16px;
                     spacing: 8px;
 
+                    SectionHeading { text: "Preset"; }
+                    // Preset: pick one to set formats, quality and resizing in one go; "Custom"
+                    // when the settings don't match any.
+                    Rectangle {
+                        background: Ui.card;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: Ui.card-border;
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 36px;
+                                        height: 36px;
+                                        border-radius: 9px;
+                                        background: Ui.tint;
+                                        Icon {
+                                            glyph: Glyph.preset;
+                                            color: Palette.accent-background;
+                                            font-size: 18px;
+                                        }
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    ComboBox {
+                                        model: root.preset-names;
+                                        current-index <=> root.preset-index;
+                                        enabled: root.idle;
+                                        selected => { root.apply-preset(self.current-index); }
+                                    }
+                                }
+                            }
+                            VerticalLayout {
+                                padding-left: 48px;
+                                spacing: 8px;
+                                Text {
+                                    text: root.preset-summary;
+                                    font-size: 12px;
+                                    color: Ui.secondary;
+                                    wrap: word-wrap;
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    GlyphButton {
+                                        glyph: Glyph.save;
+                                        text: "Save as preset…";
+                                        enabled: root.idle;
+                                        clicked => {
+                                            root.preset-error = "";
+                                            root.preset-dialog-open = true;
+                                        }
+                                    }
+                                    if root.preset-deletable: GlyphButton {
+                                        glyph: Glyph.clear;
+                                        enabled: root.idle;
+                                        accessible-label: "Delete this preset";
+                                        clicked => { root.delete-preset(); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 4px; }
                     SectionHeading { text: "Output formats"; }
                     SettingCard {
                         glyph: Glyph.webp;
@@ -1723,5 +1888,16 @@ export component AppWindow inherits Window {
         open-website => { root.open-website(); }
         open-source => { root.open-source(); }
         close => { root.about-open = false; }
+    }
+
+    if root.preset-dialog-open: PresetDialog {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        summary: root.preset-summary;
+        error: root.preset-error;
+        save(name) => { root.save-preset(name); }
+        close => { root.preset-dialog-open = false; }
     }
 }
