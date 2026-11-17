@@ -1,8 +1,8 @@
 # Gravingine Image Optimizer
 
-A native Windows image optimizer written in Rust, with a classic Win32 UI built from the real
-Windows common controls ([native-windows-gui](https://github.com/gabdube/native-windows-gui)).
-Drag & drop images or whole folders, pick the web formats you want, and get smaller files.
+A Windows image optimizer written in Rust, with a [Slint](https://slint.dev) UI in Slint's
+Cosmic style. Drag & drop images or whole folders, pick the web formats you want, and get
+smaller files.
 
 ## Features
 
@@ -18,15 +18,14 @@ Drag & drop images or whole folders, pick the web formats you want, and get smal
 - **Resize** to fit a maximum width/height, or scale to 75%, 50%, 25% or a custom percentage (aspect ratio kept, never upscales).
 - Strips metadata (EXIF/GPS) and bakes in EXIF orientation.
 - *Skip outputs larger than the original* so you never end up with a worse file.
-- File list as tiles: thumbnail with a status badge, bold file name, image size and format, what will be produced (or the colored result), and where it was saved, with a progress bar while optimizing. Tick the images to process; *Select all* / *Select none*.
+- File list as tiles: thumbnail with a status badge, file name and format, what will be produced (or the colored result) and where it was saved, with a progress bar while optimizing. On the right, *Original* and *Output* columns: dimensions and file size before, and the resized dimensions and smallest saved size after. Tick the images to process; *Select all* / *Select none*.
 - Parallel processing on all CPU cores, cancellable, with per-file and total savings, progress on the taskbar button, and a taskbar flash when a run finishes in the background.
 - Settings are remembered between runs (`%APPDATA%\Gravingine Image Optimizer\settings.json`).
-- Windows 11 look built on real Win32 controls:
-  - follows Windows' **light/dark mode** and **accent color**, live (dark title bar, dark scrollbars, fields and dropdowns);
-  - a scrolling settings pane: each output format (and resizing) is its own card with a tinted icon, a short description and a toggle switch; a format's sliders appear inside its card only while it is switched on;
-  - Windows 11 style toggles, checkboxes and sliders (Segoe UI Variable), an accent *Optimize* button, tooltips on every setting;
+- Slint UI (Cosmic style):
+  - follows Windows' **light/dark mode**, live, and tints its accent from the Windows **accent color**; the title bar matches the window;
+  - a scrolling settings pane: each output format (and resizing) is its own card with a tinted icon, a short description and a switch; a format's sliders slide open inside its card while it is switched on;
   - the file list highlights while files are dragged over the window;
-  - DPI aware; icons drawn at runtime from the Windows icon font (Segoe Fluent Icons, or Segoe MDL2 Assets on Windows 10), so no image files are shipped.
+  - scales per monitor; icons are glyphs from the Windows icon font (Segoe Fluent Icons, or Segoe MDL2 Assets on Windows 10), so no image files are shipped.
 
 Inputs: jpg, jpeg, jfif, png, webp, gif, bmp, tif, tiff, ico.
 
@@ -52,20 +51,14 @@ cargo test     # encoder + pipeline tests
 
 ## Project layout
 
+- `ui/app.slint` – the whole window: settings cards, file list tiles, toolbar and footer (compiled by `build.rs` with the Cosmic style)
 - `src/app.rs` – app state and behavior: adding images, thumbnails, selection, runs, window events
-- `src/ui.rs` – building and laying out the controls; applying the theme
-- `src/theme.rs` – light/dark palette and accent color from Windows, dark mode for Win32 controls, title bar, fonts
-- `src/skin.rs` – window background, settings pane cards and icon tiles, control colors, custom-drawn toggles, checkboxes, sliders and accent button
-- `src/geom.rs` – window geometry in logical pixels (cached DPI scale, skips no-op moves)
-- `src/tiles.rs` – the file list (a native list view in Tiles view, custom drawn)
-- `src/draw.rs` – anti-aliased GDI drawing helpers
-- `src/icons.rs` – renders icon-font glyphs into native icons (buttons, badges, window)
-- `src/droptarget.rs` – OLE drop target (drag-hover highlight), `src/taskbar.rs` – taskbar progress
 - `src/optimizer.rs` – decoding, resizing and encoding
-- `res/app.manifest` – embedded by `build.rs`: Common Controls v6 (visual styles) and DPI awareness
+- `src/taskbar.rs` – taskbar button progress and flash
+- `src/winicon.rs` – app icon, icon-font detection and title bar tint (Win32)
+- `res/app.manifest` – embedded by `build.rs`: Common Controls v6 (system dialogs) and per-monitor DPI awareness
 
-Dark mode for Win32 controls uses the same undocumented `uxtheme.dll` functions that Windows' own
-apps use; a future Windows update could change them.
+The Win32 (native-windows-gui) version of the UI is kept on the `win32-ui` branch.
 
 Debug builds can render their own window to a PNG and exit, which is handy for checking the layout
 (snapshot runs never save settings):
@@ -74,11 +67,7 @@ Debug builds can render their own window to a PNG and exit, which is handy for c
 GIO_SNAPSHOT=window.png cargo run -- "D:\Photos"
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 cargo run -- "D:\Photos"   # optimize first, then capture
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_MIDRUN=300 cargo run -- "D:\Photos"   # capture while optimizing
-GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_UNCHECK=0 cargo run -- "D:\Photos"   # untick the first image first
-GIO_THEME=dark cargo run   # force dark (or light) instead of following Windows
-GIO_SNAPSHOT_RAW=1 GIO_SNAPSHOT=window.png cargo run   # capture exactly what is on screen (no forced repaint)
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_ALL_ON=1 cargo run   # switch every format and resizing on first
-GIO_SNAPSHOT=window.png GIO_SNAPSHOT_ALL_ON=1 GIO_SNAPSHOT_SCROLL=400 cargo run   # ...and scroll the settings pane
+GIO_THEME=dark cargo run   # force dark (or light) instead of following Windows
 cargo build --release --features snapshot   # the same self-snapshots in an optimized build
-GIO_SNAPSHOT=x GIO_BENCH_RESIZE=1 ./target/release/gravingine_image_optimizer.exe   # time resize frames (snapshot build)
 ```

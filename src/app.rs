@@ -1,34 +1,28 @@
-//! App state and behavior: adding images, thumbnails, selection, running the optimizer,
-//! and reacting to window events. The controls themselves are built in [`crate::ui`].
+//! App state and behavior: adding images, thumbnails, selection, running the optimizer and
+//! reacting to window events. The window itself is described in `ui/app.slint`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use native_windows_gui as nwg;
 use rayon::prelude::*;
-use winapi::shared::minwindef::{LPARAM, LRESULT, WPARAM};
+use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
+use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 use winapi::shared::windef::HWND;
 
-use crate::droptarget::{self, DragEvent};
-use crate::geom;
 use crate::optimizer::{self, Format, FormatResult, OutputLocation, Outcome, ResizeMode, Settings, Source};
-use crate::skin;
 use crate::taskbar::{self, Taskbar};
-use crate::tiles::{self, Badge, TileView, Tone};
-use crate::ui::{self, CONTENT_X, Controls, EMPTY_ICON, FOOTER_H, MARGIN, PERCENT_PRESETS, TOP, checked, set_checked};
+use crate::{AppWindow, TileData, Ui, winicon};
 
-/// Timer that animates progress bars on tiles being optimized.
-const ANIMATION_TIMER: usize = 0x4701;
-/// Posted to the main window: tile checkboxes changed.
-const WM_APP_CHECKS: u32 = winapi::um::winuser::WM_APP + 1;
-/// Posted to the main window: Windows' light/dark mode or accent color changed.
-const WM_APP_THEME: u32 = winapi::um::winuser::WM_APP + 2;
+const PERCENT_PRESETS: [u32; 3] = [75, 50, 25];
+/// Thumbnail size in the list (logical pixels).
+const THUMB: f32 = 72.0;
+const IMAGE_EXTENSIONS: [&str; 10] = ["jpg", "jpeg", "jfif", "png", "webp", "gif", "bmp", "tif", "tiff", "ico"];
 
 #[derive(Clone, Debug)]
 enum Status {
@@ -47,10 +41,18 @@ struct Job {
     status: Status,
     /// Ticked in the list: included in the next run.
     selected: bool,
-    /// Thumbnail index in the tiles' image list.
-    thumb: i32,
-    /// "3840 × 2160 · JPEG", once the thumbnail worker has read the image.
-    info: Option<String>,
+    thumb: Option<Image>,
+    meta: Meta,
+    /// Output dimensions of the last run (`None`: kept its size). Set when a run starts.
+    run_dims: Option<(u32, u32)>,
+}
+
+/// What the thumbnail worker found out about an image.
+#[derive(Clone, Copy)]
+enum Meta {
+    Loading,
+    Read { width: u32, height: u32, format: &'static str },
+    Unreadable,
 }
 
 /// A decoded thumbnail (or the reason it couldn't be made) for job `id`.
@@ -85,92 +87,83 @@ struct State {
     plan: String,
     thumbs: Option<Receiver<ThumbMsg>>,
     thumb_tx: Option<Sender<ThumbMsg>>,
-    /// Files are being dragged over the window.
-    drag_hover: bool,
+}
+
+/// Wakes the UI thread from a worker, at most once until the UI thread has handled it.
+#[derive(Clone)]
+struct Waker {
+    queued: Arc<AtomicBool>,
+    on_wake: fn(&App),
+}
+
+impl Waker {
+    fn new(on_wake: fn(&App)) -> Self {
+        Waker { queued: Arc::new(AtomicBool::new(false)), on_wake }
+    }
+
+    fn wake(&self) {
+        if self.queued.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (queued, on_wake) = (self.queued.clone(), self.on_wake);
+        let _ = slint::invoke_from_event_loop(move || {
+            queued.store(false, Ordering::SeqCst);
+            with_app(on_wake);
+        });
+    }
 }
 
 pub struct App {
-    c: Controls,
-    tiles: tiles::Tiles,
+    ui: AppWindow,
+    tiles: Rc<VecModel<TileData>>,
     taskbar: RefCell<Option<Taskbar>>,
-    /// A WM_APP_CHECKS message is already queued.
-    checks_pending: std::cell::Cell<bool>,
-    /// How far the settings pane is scrolled (logical pixels).
-    pane_scroll: std::cell::Cell<i32>,
-    // Never hold a borrow while calling into controls: Win32 calls can re-enter the event handler.
+    run_waker: Waker,
+    thumb_waker: Waker,
+    /// Files dropped on the window, added together once the drop is complete.
+    dropped: RefCell<Vec<PathBuf>>,
+    drop_flush_queued: Cell<bool>,
+    // Never hold a borrow while calling into the UI: callbacks can re-enter the app.
     state: RefCell<State>,
 }
 
-pub fn run() -> Result<(), nwg::NwgError> {
-    nwg::init()?;
-    let c = ui::build()?;
-    let tiles = tiles::Tiles::new(c.list_hwnd());
+thread_local! {
+    static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with the app (UI thread only).
+fn with_app(f: impl FnOnce(&App)) {
+    let app = APP.with(|a| a.borrow().clone());
+    if let Some(app) = app {
+        f(&app);
+    }
+}
+
+pub fn run() -> Result<(), slint::PlatformError> {
+    // The winit backend gives access to the native window (drops, taskbar, title bar).
+    slint::BackendSelector::new().backend_name("winit".into()).select()?;
+    let ui = AppWindow::new()?;
+    ui.global::<Ui>().set_icon_font(winicon::icon_font_face().into());
+    match std::env::var("GIO_THEME").as_deref() {
+        Ok("dark") => ui.invoke_set_dark(true),
+        Ok("light") => ui.invoke_set_dark(false),
+        _ => {}
+    }
+    let tiles = Rc::new(VecModel::default());
+    ui.set_tiles(ModelRc::from(tiles.clone()));
     let app = Rc::new(App {
-        c,
+        ui,
         tiles,
         taskbar: RefCell::new(None),
-        checks_pending: std::cell::Cell::new(false),
-        pane_scroll: std::cell::Cell::new(0),
+        run_waker: Waker::new(App::poll_messages),
+        thumb_waker: Waker::new(App::poll_thumbnails),
+        dropped: RefCell::new(Vec::new()),
+        drop_flush_queued: Cell::new(false),
         state: RefCell::new(State::default()),
     });
+    APP.with(|a| *a.borrow_mut() = Some(app.clone()));
     app.apply_settings(&load_settings());
-    app.c.apply_theme(&app.tiles);
-    app.layout();
+    app.bind();
     app.refresh_rows();
-
-    let weak = Rc::downgrade(&app);
-    let handler = nwg::full_bind_event_handler(&app.c.window.handle, move |evt, data, handle| {
-        if let Some(app) = weak.upgrade() {
-            app.on_event(evt, &data, handle);
-        }
-    });
-    // Raw handlers run before native-windows-gui's own: painting, colors, custom draw.
-    let weak = Rc::downgrade(&app);
-    let window_raw = nwg::bind_raw_event_handler(&app.c.window.handle, 0x10010, move |hwnd, msg, w, l| {
-        weak.upgrade().and_then(|app| app.on_raw(hwnd, msg, w, l))
-    })?;
-    let list_raw = {
-        let window = app.c.window_hwnd();
-        nwg::bind_raw_event_handler(&app.c.list.handle, 0x10011, move |hwnd, msg, w, l| skin::handle(window, hwnd, msg, w, l))?
-    };
-    // Settings pane: its own painting and color messages (from the controls inside it), plus
-    // scrolling. Sliders and dropdowns would otherwise eat the mouse wheel; send it to the pane.
-    let mut pane_raw = Vec::new();
-    if let Some(pane) = app.c.pane.handle.hwnd() {
-        let window = app.c.window_hwnd();
-        let weak = Rc::downgrade(&app);
-        pane_raw.push(nwg::bind_raw_event_handler(&app.c.pane.handle, 0x10012, move |hwnd, msg, w, l| {
-            if let Some(app) = weak.upgrade()
-                && let Some(r) = app.on_pane_raw(msg, w)
-            {
-                return Some(r);
-            }
-            skin::handle(window, hwnd, msg, w, l)
-        })?);
-        let wheel_takers: Vec<nwg::ControlHandle> = app.c.sliders().iter().map(|s| s.bar.handle).chain([app.c.resize_mode.handle, app.c.save_mode.handle]).collect();
-        for handle in wheel_takers {
-            pane_raw.push(nwg::bind_raw_event_handler(&handle, 0x10013, move |_hwnd, msg, w, l| {
-                (msg == winapi::um::winuser::WM_MOUSEWHEEL).then(|| unsafe { winapi::um::winuser::SendMessageW(pane, msg, w, l) })
-            })?);
-        }
-        // Text boxes: let the library paint its frame, then fix its padding color.
-        for handle in [app.c.output_dir.handle, app.c.max_width.handle, app.c.max_height.handle, app.c.percent.handle] {
-            pane_raw.push(nwg::bind_raw_event_handler(&handle, 0x10014, move |hwnd, msg, w, l| {
-                if msg != winapi::um::winuser::WM_NCPAINT {
-                    return None;
-                }
-                let result = unsafe { winapi::um::commctrl::DefSubclassProc(hwnd, msg, w, l) };
-                skin::repaint_field_padding(hwnd);
-                Some(result)
-            })?);
-        }
-    }
-    // Know when files are dragged over the window, not only when they're dropped.
-    let weak = Rc::downgrade(&app);
-    let _drop_target = droptarget::register(
-        app.c.window_hwnd(),
-        Box::new(move |event| weak.upgrade().is_some_and(|app| app.on_drag(event))),
-    );
 
     // Files/folders passed on the command line (e.g. dropped onto the .exe icon).
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -178,208 +171,143 @@ pub fn run() -> Result<(), nwg::NwgError> {
         app.add_paths(args);
     }
 
+    // The native window exists once the event loop runs.
+    slint::Timer::single_shot(Duration::ZERO, || with_app(App::on_window_ready));
     #[cfg(any(debug_assertions, feature = "snapshot"))]
-    snapshot::schedule(&app.c.snapshot_notice);
+    snapshot::schedule();
 
-    // Show the window only now that its paint handlers, theme and layout are in place.
-    app.c.window.set_visible(true);
-    unsafe {
-        use winapi::um::winuser::{RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow, SetForegroundWindow};
-        let window = app.c.window_hwnd();
-        RedrawWindow(window, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
-        SetForegroundWindow(window);
-    }
-
-    nwg::dispatch_thread_events();
-    nwg::unbind_raw_event_handler(&window_raw)?;
-    nwg::unbind_raw_event_handler(&list_raw)?;
-    for h in &pane_raw {
-        nwg::unbind_raw_event_handler(h)?;
-    }
-    nwg::unbind_event_handler(&handler);
+    app.ui.run()?;
+    save_settings(&app.read_settings());
+    APP.with(|a| a.borrow_mut().take());
     Ok(())
 }
 
 impl App {
-    fn on_event(&self, evt: nwg::Event, data: &nwg::EventData, handle: nwg::ControlHandle) {
-        use nwg::Event as E;
-        let c = &self.c;
-        match evt {
-            E::OnWindowClose if handle == c.window.handle => {
-                save_settings(&self.read_settings());
-                nwg::stop_thread_dispatch();
-            }
-            E::OnResize | E::OnWindowMaximize | E::OnWindowMinimize if handle == c.window.handle => self.layout(),
-            E::OnFileDrop => {
-                let paths: Vec<PathBuf> = data.on_file_drop().files().into_iter().map(PathBuf::from).collect();
-                self.add_paths(paths);
-            }
-            E::OnNotice if handle == c.notice.handle => self.poll_messages(),
-            E::OnNotice if handle == c.thumb_notice.handle => self.poll_thumbnails(),
-            #[cfg(any(debug_assertions, feature = "snapshot"))]
-            E::OnNotice if handle == c.snapshot_notice.handle => snapshot::on_notice(self),
-            E::OnHorizontalScroll | E::TrackBarUpdated => {
-                for s in c.sliders() {
-                    s.sync();
+    fn bind(&self) {
+        let ui = &self.ui;
+        ui.on_add_files(|| with_app(App::add_files));
+        ui.on_add_folder(|| with_app(App::add_folder));
+        ui.on_clear_all(|| with_app(App::clear));
+        ui.on_select_all(|| with_app(|a| a.select_all(true)));
+        ui.on_select_none(|| with_app(|a| a.select_all(false)));
+        ui.on_browse(|| with_app(App::browse_output));
+        ui.on_optimize(|| with_app(App::start));
+        ui.on_cancel(|| {
+            with_app(|a| {
+                if let Some(run) = &a.state.borrow().run {
+                    run.cancel.store(true, Ordering::SeqCst);
                 }
-                self.sync_controls();
-            }
-            E::OnButtonClick => self.on_click(&handle),
-            E::OnComboxBoxSelection if handle == c.save_mode.handle => {
-                if c.save_mode.selection() == Some(1) && c.output_dir.text().is_empty() {
-                    self.browse_output();
+            })
+        });
+        ui.on_open_output(|| {
+            with_app(|a| {
+                let dir = a.state.borrow().last_output_dir.clone();
+                if let Some(dir) = dir {
+                    open_in_explorer(&dir);
                 }
-                self.sync_controls();
+            })
+        });
+        ui.on_settings_changed(|| with_app(App::sync));
+        ui.on_tile_toggled(|row, on| with_app(|a| a.set_selected(row as usize, on)));
+        ui.window().on_winit_window_event(|_, event| {
+            with_app(|a| a.on_window_event(event));
+            EventResult::Propagate
+        });
+    }
+
+    fn on_window_ready(&self) {
+        if let Some(hwnd) = self.hwnd() {
+            winicon::set_window_icon(hwnd);
+        }
+        self.tint_title_bar();
+    }
+
+    fn on_window_event(&self, event: &winit::event::WindowEvent) {
+        use winit::event::WindowEvent as E;
+        match event {
+            E::HoveredFile(_) => {
+                if self.state.borrow().run.is_none() && !self.ui.get_drag_hover() {
+                    self.ui.set_drag_hover(true);
+                }
             }
-            E::OnComboxBoxSelection | E::OnTextInput => self.sync_controls(),
+            E::HoveredFileCancelled => self.ui.set_drag_hover(false),
+            // One event per file: collect them and add them together.
+            E::DroppedFile(path) => {
+                self.ui.set_drag_hover(false);
+                self.dropped.borrow_mut().push(path.clone());
+                if !self.drop_flush_queued.replace(true) {
+                    slint::Timer::single_shot(Duration::ZERO, || {
+                        with_app(|a| {
+                            a.drop_flush_queued.set(false);
+                            let paths = std::mem::take(&mut *a.dropped.borrow_mut());
+                            a.add_paths(paths);
+                        })
+                    });
+                }
+            }
+            E::ThemeChanged(_) => self.tint_title_bar(),
             _ => {}
         }
     }
 
-    /// Messages handled before native-windows-gui sees them.
-    fn on_raw(&self, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
-        use winapi::um::commctrl::NM_CUSTOMDRAW;
-        use winapi::um::winuser::{NMHDR, PostMessageW, WM_NOTIFY, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_TIMER};
-        let window = self.c.window_hwnd();
-        match msg {
-            // Deferred work posted below (a posted message runs after the current one finishes;
-            // native-windows-gui's Notice would run synchronously on this thread).
-            WM_APP_CHECKS => {
-                self.checks_pending.set(false);
-                self.on_checks_changed();
-                Some(0)
-            }
-            WM_APP_THEME => {
-                self.c.apply_theme(&self.tiles);
-                self.sync_controls();
-                Some(0)
-            }
-            WM_NOTIFY => {
-                let list = self.c.list_hwnd();
-                if unsafe { tiles::is_check_change(list, l) } {
-                    // Many items can change at once (Select all, rebuilding the list): handle once.
-                    if !self.checks_pending.replace(true) {
-                        unsafe { PostMessageW(window, WM_APP_CHECKS, 0, 0) };
-                    }
-                    return None;
-                }
-                let hdr = unsafe { &*(l as *const NMHDR) };
-                if hdr.hwndFrom == list && hdr.code == NM_CUSTOMDRAW {
-                    return self.tiles.custom_draw(l);
-                }
-                skin::handle(window, hwnd, msg, w, l)
-            }
-            // Minimum window size (handled here: native-windows-gui's version leaks a DC per call,
-            // and this message arrives continuously while resizing).
-            winapi::um::winuser::WM_GETMINMAXINFO if hwnd == window => {
-                let info = unsafe { &mut *(l as *mut winapi::um::winuser::MINMAXINFO) };
-                info.ptMinTrackSize.x = geom::px(CONTENT_X + 420);
-                info.ptMinTrackSize.y = geom::px(560);
-                Some(0)
-            }
-            WM_TIMER if w == ANIMATION_TIMER => {
-                self.tiles.animate();
-                Some(0)
-            }
-            WM_SETTINGCHANGE | WM_SYSCOLORCHANGE => {
-                // "ImmersiveColorSet": Windows switched light/dark mode or the accent color.
-                if msg == WM_SYSCOLORCHANGE || is_immersive_color_change(l) {
-                    unsafe { PostMessageW(window, WM_APP_THEME, 0, 0) };
-                }
-                None
-            }
-            _ => skin::handle(window, hwnd, msg, w, l),
-        }
+    fn hwnd(&self) -> Option<HWND> {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        self.ui.window().with_winit_window(|w| match w.window_handle().ok()?.as_raw() {
+            RawWindowHandle::Win32(h) => Some(h.hwnd.get() as HWND),
+            _ => None,
+        })?
     }
 
-    fn on_drag(&self, event: DragEvent) -> bool {
-        match event {
-            DragEvent::Enter => {
-                if self.state.borrow().run.is_some() {
-                    return false;
-                }
-                self.state.borrow_mut().drag_hover = true;
-                self.show_drag_hover(true);
-                true
-            }
-            DragEvent::Leave => {
-                self.state.borrow_mut().drag_hover = false;
-                self.show_drag_hover(false);
-                true
-            }
-            DragEvent::Drop(paths) => {
-                self.add_paths(paths);
-                true
-            }
-        }
-    }
-
-    fn show_drag_hover(&self, on: bool) {
-        let c = &self.c;
-        skin::set_drag_hover(on);
-        c.empty_title.set_text(if on { "Release to add images" } else { "Drop images or folders here" });
-        unsafe { winapi::um::winuser::InvalidateRect(c.window_hwnd(), std::ptr::null(), 1) };
-    }
-
-    fn on_click(&self, h: &nwg::ControlHandle) {
-        let c = &self.c;
-        if *h == c.add_files.handle {
-            if c.files_dialog.run(Some(&c.window))
-                && let Ok(items) = c.files_dialog.get_selected_items()
-            {
-                self.add_paths(items.into_iter().map(PathBuf::from).collect());
-            }
-        } else if *h == c.add_folder.handle {
-            if c.folder_dialog.run(Some(&c.window))
-                && let Ok(dir) = c.folder_dialog.get_selected_item()
-            {
-                self.add_paths(vec![PathBuf::from(dir)]);
-            }
-        } else if *h == c.clear.handle {
-            self.clear();
-        } else if *h == c.select_all.handle || *h == c.select_none.handle {
-            let select = *h == c.select_all.handle;
-            let count = self.state.borrow().jobs.len();
-            for row in 0..count {
-                self.tiles.set_checked(row, select);
-            }
-            self.on_checks_changed();
-        } else if *h == c.browse.handle {
-            self.browse_output();
-            self.sync_controls();
-        } else if *h == c.optimize.handle {
-            self.start();
-        } else if *h == c.cancel.handle {
-            if let Some(run) = &self.state.borrow().run {
-                run.cancel.store(true, Ordering::SeqCst);
-            }
-        } else if *h == c.open_output.handle {
-            let dir = self.state.borrow().last_output_dir.clone();
-            if let Some(dir) = dir {
-                open_in_explorer(&dir);
-            }
+    /// Title bar in the window's own background color (Cosmic's palette), light or dark.
+    fn tint_title_bar(&self) {
+        let Some(hwnd) = self.hwnd() else { return };
+        let dark = match std::env::var("GIO_THEME").as_deref() {
+            Ok("dark") => true,
+            Ok("light") => false,
+            _ => self.ui.window().with_winit_window(|w| w.theme()).flatten() == Some(winit::window::Theme::Dark),
+        };
+        if dark {
+            winicon::tint_title_bar(hwnd, true, (0x1B, 0x1B, 0x1B), (0xC4, 0xC4, 0xC4));
         } else {
-            // Settings checkboxes: update enabled controls and the plan shown on waiting tiles.
-            self.sync_controls();
+            winicon::tint_title_bar(hwnd, false, (0xD7, 0xD7, 0xD7), (0x29, 0x29, 0x29));
+        }
+    }
+
+    // -------------------------------------------------------------- dialogs
+
+    fn add_files(&self) {
+        let files = self.ui.window().with_winit_window(|w| {
+            rfd::FileDialog::new().set_title("Add images").add_filter("Images", &IMAGE_EXTENSIONS).set_parent(w).pick_files()
+        });
+        if let Some(files) = files.flatten() {
+            self.add_paths(files);
+        }
+    }
+
+    fn add_folder(&self) {
+        if let Some(dir) = self.pick_folder("Add a folder of images") {
+            self.add_paths(vec![dir]);
         }
     }
 
     fn browse_output(&self) {
-        let c = &self.c;
-        if c.folder_dialog.run(Some(&c.window))
-            && let Ok(dir) = c.folder_dialog.get_selected_item()
-        {
-            c.output_dir.set_text(&PathBuf::from(dir).display().to_string());
-        } else if c.output_dir.text().is_empty() {
+        if let Some(dir) = self.pick_folder("Save optimized images to") {
+            self.ui.set_output_dir(dir.display().to_string().into());
+            self.ui.set_save_mode(1);
+        } else if self.ui.get_output_dir().is_empty() {
             // Nothing chosen: fall back to the default location.
-            c.save_mode.set_selection(Some(0));
+            self.ui.set_save_mode(0);
         }
+        self.sync();
+    }
+
+    fn pick_folder(&self, title: &str) -> Option<PathBuf> {
+        self.ui.window().with_winit_window(|w| rfd::FileDialog::new().set_title(title).set_parent(w).pick_folder()).flatten()
     }
 
     // -------------------------------------------------------------- jobs
 
     fn add_paths(&self, paths: Vec<PathBuf>) {
-        self.read_checks();
         {
             let mut st = self.state.borrow_mut();
             if st.run.is_some() {
@@ -431,18 +359,39 @@ impl App {
             st.notice.clear();
         }
         self.refresh_rows();
-        self.tiles.reset_images();
     }
 
-    /// Decode thumbnails on worker threads; results come back through `thumb_notice`.
+    fn set_selected(&self, row: usize, on: bool) {
+        {
+            let mut st = self.state.borrow_mut();
+            if st.run.is_some() {
+                return;
+            }
+            match st.jobs.get_mut(row) {
+                Some(job) => job.selected = on,
+                None => return,
+            }
+        }
+        self.update_rows(&[row]);
+        self.sync();
+    }
+
+    fn select_all(&self, on: bool) {
+        for job in self.state.borrow_mut().jobs.iter_mut() {
+            job.selected = on;
+        }
+        self.refresh_rows();
+    }
+
+    /// Decode thumbnails on worker threads; results come back through `poll_thumbnails`.
     fn queue_thumbnails(&self, tx: Sender<ThumbMsg>, items: Vec<(u64, PathBuf)>) {
-        let notice = self.c.thumb_notice.sender();
-        let size = crate::icons::px(tiles::THUMB) as u32;
+        let size = (THUMB * self.ui.window().scale_factor()).round() as u32;
+        let waker = self.thumb_waker.clone();
         std::thread::spawn(move || {
             items.into_par_iter().for_each_with(tx, |tx, (id, path)| {
                 let result = optimizer::thumbnail(&path, size).map_err(|e| format!("{e:#}"));
                 let _ = tx.send(ThumbMsg { id, result });
-                notice.notice();
+                waker.wake();
             });
         });
     }
@@ -453,19 +402,17 @@ impl App {
             None => return,
         };
         let mut changed = Vec::new();
-        for msg in msgs {
-            let thumb = match &msg.result {
-                Ok(t) => Some((self.tiles.add_thumbnail(&t.bgra), format!("{} × {} · {}", t.width, t.height, t.format))),
-                Err(_) => None,
-            };
+        {
             let mut st = self.state.borrow_mut();
-            // The job may have been cleared while its thumbnail was being made.
-            if let Some(i) = st.jobs.iter().position(|j| j.id == msg.id) {
-                if let Some((index, info)) = thumb {
-                    st.jobs[i].thumb = index;
-                    st.jobs[i].info = Some(info);
-                } else {
-                    st.jobs[i].info = Some("Can't read this image".into());
+            for msg in msgs {
+                // The job may have been cleared while its thumbnail was being made.
+                let Some(i) = st.jobs.iter().position(|j| j.id == msg.id) else { continue };
+                match msg.result {
+                    Ok(t) => {
+                        st.jobs[i].meta = Meta::Read { width: t.width, height: t.height, format: t.format };
+                        st.jobs[i].thumb = Some(Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&t.rgba, t.size, t.size)));
+                    }
+                    Err(_) => st.jobs[i].meta = Meta::Unreadable,
                 }
                 changed.push(i);
             }
@@ -473,33 +420,9 @@ impl App {
         self.update_rows(&changed);
     }
 
-    /// Copy the tiles' checkbox states into the jobs.
-    fn read_checks(&self) {
-        let count = self.state.borrow().jobs.len();
-        if self.c.list.len() != count {
-            return;
-        }
-        let checks: Vec<bool> = (0..count).map(|row| self.tiles.is_checked(row)).collect();
-        for (job, checked) in self.state.borrow_mut().jobs.iter_mut().zip(checks) {
-            job.selected = checked;
-        }
-    }
-
-    fn on_checks_changed(&self) {
-        let before: Vec<bool> = self.state.borrow().jobs.iter().map(|j| j.selected).collect();
-        self.read_checks();
-        let changed: Vec<usize> = {
-            let st = self.state.borrow();
-            st.jobs.iter().zip(before).enumerate().filter(|(_, (j, b))| j.selected != *b).map(|(i, _)| i).collect()
-        };
-        self.update_rows(&changed);
-        self.sync_controls();
-    }
-
     fn start(&self) {
-        self.read_checks();
         let settings = self.read_settings();
-        let custom_without_dir = self.c.save_mode.selection() == Some(1) && self.c.output_dir.text().is_empty();
+        let custom_without_dir = self.ui.get_save_mode() == 1 && self.ui.get_output_dir().trim().is_empty();
         let notice = {
             let mut st = self.state.borrow_mut();
             if st.run.is_some() || st.jobs.is_empty() {
@@ -515,6 +438,10 @@ impl App {
                 // Re-run every selected image so changed settings apply to it.
                 for job in st.jobs.iter_mut().filter(|j| j.selected) {
                     job.status = Status::Pending;
+                    job.run_dims = match job.meta {
+                        Meta::Read { width, height, .. } => optimizer::target_size(width, height, &settings),
+                        _ => None,
+                    };
                 }
                 let work: Vec<(usize, Source)> =
                     st.jobs.iter().enumerate().filter(|(_, j)| j.selected).map(|(i, j)| (i, j.source.clone())).collect();
@@ -524,22 +451,23 @@ impl App {
                 st.run = Some(Run { rx, cancel: cancel.clone(), started: Instant::now(), total: work.len() });
                 st.elapsed = None;
                 st.notice.clear();
-                let sender = self.c.notice.sender();
+                let waker = self.run_waker.clone();
                 let worker_settings = settings.clone();
-                std::thread::spawn(move || run_jobs(work, worker_settings, cancel, tx, sender));
+                std::thread::spawn(move || run_jobs(work, worker_settings, cancel, tx, waker));
                 None
             }
         };
         match notice {
             Some(n) => {
                 self.state.borrow_mut().notice = n.into();
-                self.sync_controls();
+                self.sync();
             }
             None => {
                 save_settings(&settings);
                 self.taskbar_progress(0, 1);
-                unsafe { winapi::um::winuser::SetTimer(self.c.window_hwnd(), ANIMATION_TIMER, 40, None) };
                 self.refresh_rows();
+                #[cfg(any(debug_assertions, feature = "snapshot"))]
+                snapshot::on_run_started();
             }
         }
     }
@@ -582,28 +510,27 @@ impl App {
             }
         }
         if finished {
-            unsafe { winapi::um::winuser::KillTimer(self.c.window_hwnd(), ANIMATION_TIMER) };
             if let Some(t) = self.taskbar.borrow().as_ref() {
                 t.clear();
             }
-            taskbar::flash_if_background(self.c.window_hwnd());
-            // Cancelled images go back to waiting, so redraw every tile.
+            if let Some(hwnd) = self.hwnd() {
+                taskbar::flash_if_background(hwnd);
+            }
+            // Cancelled images go back to waiting, so rebuild every tile.
             self.refresh_rows();
+            #[cfg(any(debug_assertions, feature = "snapshot"))]
+            snapshot::on_run_finished();
         } else {
             self.taskbar_progress(progress.0, progress.1);
             self.update_rows(&changed);
-            self.sync_controls();
-        }
-        #[cfg(any(debug_assertions, feature = "snapshot"))]
-        if finished {
-            snapshot::on_run_finished(self);
+            self.sync();
         }
     }
 
     fn taskbar_progress(&self, done: u64, total: u64) {
         let mut taskbar = self.taskbar.borrow_mut();
         if taskbar.is_none() {
-            *taskbar = Taskbar::new(self.c.window_hwnd());
+            *taskbar = self.hwnd().and_then(Taskbar::new);
         }
         if let Some(t) = taskbar.as_ref() {
             t.progress(done, total);
@@ -614,30 +541,29 @@ impl App {
 
     /// Rebuild every tile from the jobs.
     fn refresh_rows(&self) {
-        let list = &self.c.list;
-        self.state.borrow_mut().plan = plan_text(&self.read_settings());
-        let views: Vec<TileView> = {
-            let st = self.state.borrow();
-            st.jobs.iter().map(|j| tile_view(j, &st.plan)).collect()
+        let settings = self.read_settings();
+        let plan = plan_text(&settings);
+        let views: Vec<TileData> = {
+            let mut st = self.state.borrow_mut();
+            st.plan = plan;
+            st.jobs.iter().map(|j| tile_view(j, &st.plan, &settings)).collect()
         };
-        list.set_redraw(false);
-        self.tiles.clear();
-        for (row, view) in views.into_iter().enumerate() {
-            self.tiles.set_tile(row, view, true);
-        }
-        list.set_redraw(true);
-        list.invalidate();
-        self.sync_controls();
+        self.tiles.set_vec(views);
+        self.sync();
     }
 
-    /// Redraw the given tiles.
+    /// Update the given tiles.
     fn update_rows(&self, rows: &[usize]) {
-        let views: Vec<(usize, TileView)> = {
+        use slint::Model;
+        let settings = self.read_settings();
+        let views: Vec<(usize, TileData)> = {
             let st = self.state.borrow();
-            rows.iter().filter(|&&i| i < st.jobs.len()).map(|&i| (i, tile_view(&st.jobs[i], &st.plan))).collect()
+            rows.iter().filter(|&&i| i < st.jobs.len()).map(|&i| (i, tile_view(&st.jobs[i], &st.plan, &settings))).collect()
         };
         for (row, view) in views {
-            self.tiles.set_tile(row, view, false);
+            if row < self.tiles.row_count() {
+                self.tiles.set_row_data(row, view);
+            }
         }
     }
 
@@ -655,358 +581,116 @@ impl App {
         self.update_rows(&waiting);
     }
 
-    /// Enable/show controls to match the current settings and run state, and update the footer.
-    fn sync_controls(&self) {
-        let c = &self.c;
+    /// Bring the buttons, footer and hints up to date with the settings and run state.
+    fn sync(&self) {
         self.refresh_plan();
-        let (running, has_jobs, has_output, status, selected, total, progress) = {
+        let ui = &self.ui;
+        let settings = self.read_settings();
+        let (running, has_output, status, selected, total, progress) = {
             let st = self.state.borrow();
             let done = st.jobs.iter().filter(|j| j.selected && matches!(j.status, Status::Done(_) | Status::Failed(_))).count();
             let run_total = st.run.as_ref().map_or(0, |r| r.total);
             (
                 st.run.is_some(),
-                !st.jobs.is_empty(),
                 st.last_output_dir.as_ref().is_some_and(|d| d.exists()),
                 status_text(&st),
                 st.jobs.iter().filter(|j| j.selected).count(),
                 st.jobs.len(),
-                (done * 100).checked_div(run_total).unwrap_or(0) as u32,
+                if run_total == 0 { 0.0 } else { done as f32 / run_total as f32 },
             )
         };
         let idle = !running;
-
-        c.add_files.set_enabled(idle);
-        c.add_folder.set_enabled(idle);
-        c.clear.set_enabled(idle && has_jobs);
-        c.select_all.set_enabled(idle && selected < total);
-        c.select_none.set_enabled(idle && selected > 0);
-
-        let empty = !has_jobs;
-        if empty && !c.empty_title.visible() {
-            // The list may have been resized while the prompt was hidden.
-            self.place_empty_state();
-        }
-        ui::show(&c.empty_icon, empty);
-        for t in [&c.empty_title, &c.empty_hint, &c.empty_formats] {
-            t.set_visible(empty);
-        }
-
-        let webp = checked(&c.webp);
-        for cb in [&c.webp, &c.avif, &c.jpeg, &c.png, &c.resize, &c.skip_larger, &c.overwrite] {
-            if cb.enabled() != idle {
-                cb.set_enabled(idle);
+        ui.set_running(running);
+        ui.set_can_clear(idle && total > 0);
+        ui.set_can_select_all(idle && selected < total);
+        ui.set_can_select_none(idle && selected > 0);
+        ui.set_optimize_label(
+            match (selected, total) {
+                (0, _) => "Optimize".to_string(),
+                (s, t) if s == t => if t == 1 { "Optimize".to_string() } else { format!("Optimize all {t}") },
+                (s, _) => format!("Optimize {s} selected"),
             }
-        }
-        let enable = |cb: &nwg::CheckBox, e: bool| {
-            if cb.enabled() != e {
-                cb.set_enabled(e);
-            }
-        };
-        enable(&c.webp_lossless, idle && webp);
-        c.webp_quality.set_enabled(idle && webp && !checked(&c.webp_lossless));
-        c.avif_quality.set_enabled(idle && checked(&c.avif));
-        c.avif_speed.set_enabled(idle && checked(&c.avif));
-        c.jpeg_quality.set_enabled(idle && checked(&c.jpeg));
-        c.png_level.set_enabled(idle && checked(&c.png));
-
-        // Resize: which rows show is decided by ui::layout_pane; here only enabled state and
-        // the example text.
-        let resize = idle && checked(&c.resize);
-        let mode = c.resize_mode.selection().unwrap_or(0);
-        if c.resize_mode.enabled() != resize {
-            c.resize_mode.set_enabled(resize);
-        }
-        for input in [&c.max_width, &c.max_height, &c.percent] {
-            if input.enabled() != resize {
-                input.set_enabled(resize);
-            }
-        }
-        if mode != 0 {
-            let pct = self.read_settings().resize_percent;
-            let side = |s: u32| ((s as f64 * pct as f64 / 100.0).round() as u32).max(1);
-            c.resize_hint.set_text(&format!("Example: 4000 × 3000 → {} × {}", side(4000), side(3000)));
-        }
-
-        let custom = c.save_mode.selection() == Some(1);
-        if c.save_mode.enabled() != idle {
-            c.save_mode.set_enabled(idle);
-        }
-        c.output_dir.set_enabled(idle && custom);
-        c.browse.set_enabled(idle && custom);
-
-        // Footer.
-        let label = match (selected, total) {
-            (0, _) => "Optimize".to_string(),
-            (s, t) if s == t => if t == 1 { "Optimize".to_string() } else { format!("Optimize all {t}") },
-            (s, _) => format!("Optimize {s} selected"),
-        };
-        if c.optimize.text() != label {
-            c.optimize.set_text(&label);
-            ui::fit_accent_button(&c.optimize, 120);
-        }
-        c.optimize.set_visible(idle);
-        let can_run = idle && selected > 0 && !self.read_settings().formats().is_empty();
-        if c.optimize.enabled() != can_run {
-            c.optimize.set_enabled(can_run);
-        }
-        c.cancel.set_visible(running);
-        c.progress.set_visible(running);
-        c.progress.set_pos(progress);
-        c.open_output.set_visible(idle && has_output);
-        c.status.set_text(&status);
-        self.layout_footer();
-        // A toggle may open or close a section.
-        self.relayout_pane();
-    }
-
-    fn layout(&self) {
-        let c = &self.c;
-        let (w, h) = geom::client_size(c.window_hwnd());
-        // Settings pane: the left column, full height, scrolling when its cards don't fit.
-        geom::place(c.pane.handle.hwnd().unwrap_or(std::ptr::null_mut()), 0, TOP - 8, CONTENT_X - 1, h - (TOP - 8));
-        self.relayout_pane();
-        // The list sits inside a rounded frame painted on the window background.
-        const INSET: i32 = 4;
-        let frame_w = (w - CONTENT_X - MARGIN).max(100);
-        let frame_h = (h - TOP - FOOTER_H - 4).max(100);
-        skin::set_highlight(Some(ui::rect(CONTENT_X, TOP, CONTENT_X + frame_w, TOP + frame_h)));
-        let (list_w, list_h) = (frame_w - 2 * INSET, frame_h - 2 * INSET);
-        geom::place(c.list_hwnd(), CONTENT_X + INSET, TOP + INSET, list_w, list_h);
-        self.tiles.fit_width();
-
-        // The empty-state prompt only matters (and only costs a repaint) while it's shown.
-        if c.empty_title.visible() {
-            self.place_empty_state();
-        }
-        // Repaint the background (list frame moved); WM_PAINT draws it, so no erase needed.
-        unsafe { winapi::um::winuser::InvalidateRect(c.window_hwnd(), std::ptr::null(), 0) };
-        self.layout_footer();
-    }
-
-    /// Center the empty-state prompt in the list view (coordinates are inside the list view).
-    fn place_empty_state(&self) {
-        let c = &self.c;
-        let (list_w, list_h) = geom::client_size(c.list_hwnd());
-        let cy = list_h / 2 - 20;
-        if let Some(icon) = &c.empty_icon {
-            ui::set_rect(icon, (list_w - EMPTY_ICON) / 2, cy - EMPTY_ICON - 14, EMPTY_ICON, EMPTY_ICON);
-        }
-        let label_w = (list_w - 40).max(100);
-        c.empty_title.place(20, cy, label_w, 30);
-        c.empty_hint.place(20, cy + 36, label_w, 20);
-        c.empty_formats.place(20, cy + 58, label_w, 20);
-    }
-
-    fn layout_footer(&self) {
-        let c = &self.c;
-        let hwnd = |h: &nwg::ControlHandle| h.hwnd().unwrap_or(std::ptr::null_mut());
-        let (optimize, cancel, open, progress) =
-            (hwnd(&c.optimize.handle), hwnd(&c.cancel.handle), hwnd(&c.open_output.handle), hwnd(&c.progress.handle));
-        let (w, h) = geom::client_size(c.window_hwnd());
-        let (run_w, run_h) = geom::size(optimize);
-        let y = h - FOOTER_H + (FOOTER_H - run_h) / 2;
-        geom::move_to(optimize, CONTENT_X, y);
-        geom::move_to(cancel, CONTENT_X, y + 1);
-        let cancel_w = geom::size(cancel).0;
-        let open_w = geom::size(open).0;
-        let x = CONTENT_X + if skin::shown(cancel) { cancel_w } else { run_w } + 14;
-        let right = if skin::shown(open) { w - MARGIN - open_w - 12 } else { w - MARGIN };
-        if skin::shown(progress) {
-            geom::place(progress, x, y + run_h / 2 + 8, 200, 4);
-            c.status.place(x, y + run_h / 2 - 14, (right - x).max(50), 20);
-        } else {
-            c.status.place(x, y + (run_h - 20) / 2, (right - x).max(50), 20);
-        }
-        geom::move_to(open, w - MARGIN - open_w, y + 1);
-    }
-
-    // -------------------------------------------------------------- settings pane
-
-    /// Lay out the settings cards at the current scroll position and update the scrollbar.
-    /// Returns whether controls moved (a section opened or closed, or the scroll was clamped).
-    fn layout_pane(&self) -> bool {
-        use winapi::um::winuser::{SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SetScrollInfo};
-        let Some(pane) = self.c.pane.handle.hwnd() else { return false };
-        let (_, view_h) = geom::client_size(pane);
-        let mut scroll = self.pane_scroll.get();
-        let (mut content, mut changed) = ui::layout_pane(&self.c, scroll);
-        // Clamp (e.g. after a section closed or the window grew), then lay out again.
-        let max = (content - view_h).max(0);
-        if scroll > max {
-            scroll = max;
-            self.pane_scroll.set(scroll);
-            skin::set_pane_scroll(scroll);
-            content = ui::layout_pane(&self.c, scroll).0;
-            changed = true;
-        }
-        let info = SCROLLINFO {
-            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
-            nMin: 0,
-            nMax: geom::px(content) - 1,
-            nPage: geom::px(view_h) as u32,
-            nPos: geom::px(scroll),
-            nTrackPos: 0,
-        };
-        unsafe { SetScrollInfo(pane, SB_VERT as i32, &info, 1) };
-        changed
-    }
-
-    /// Lay out the pane with its drawing frozen, then repaint it once if controls moved. Moving
-    /// and hiding many child windows one by one while visible lets Windows copy stale pixels
-    /// around (each move blits the control's old pixels, which may already be overwritten).
-    fn relayout_pane(&self) {
-        use winapi::um::winuser::*;
-        let Some(pane) = self.c.pane.handle.hwnd() else { return };
-        unsafe { SendMessageW(pane, WM_SETREDRAW, 0, 0) };
-        let changed = self.layout_pane();
-        unsafe {
-            SendMessageW(pane, WM_SETREDRAW, 1, 0);
-            if changed {
-                RedrawWindow(pane, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
-            }
-        }
-    }
-
-    /// Scroll the settings pane to `y` (logical pixels, clamped).
-    fn scroll_pane_to(&self, y: i32) {
-        let Some(pane) = self.c.pane.handle.hwnd() else { return };
-        let (_, view_h) = geom::client_size(pane);
-        let content = ui::layout_pane(&self.c, self.pane_scroll.get()).0;
-        let y = y.clamp(0, (content - view_h).max(0));
-        if y == self.pane_scroll.get() {
-            return;
-        }
-        self.pane_scroll.set(y);
-        skin::set_pane_scroll(y);
-        unsafe {
-            use winapi::um::winuser::*;
-            // Move every control at once, then repaint the pane in one go.
-            SendMessageW(pane, WM_SETREDRAW, 0, 0);
-            self.layout_pane();
-            SendMessageW(pane, WM_SETREDRAW, 1, 0);
-            RedrawWindow(pane, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
-        }
-    }
-
-    /// Scrollbar and mouse wheel on the settings pane.
-    fn on_pane_raw(&self, msg: u32, w: WPARAM) -> Option<LRESULT> {
-        use winapi::um::winuser::*;
-        let step = 40;
-        match msg {
-            WM_MOUSEWHEEL => {
-                let delta = GET_WHEEL_DELTA_WPARAM(w) as i32;
-                self.scroll_pane_to(self.pane_scroll.get() - delta * step * 3 / 2 / WHEEL_DELTA as i32);
-                Some(0)
-            }
-            WM_VSCROLL => {
-                let pane = self.c.pane.handle.hwnd()?;
-                let (_, view_h) = geom::client_size(pane);
-                let y = self.pane_scroll.get();
-                let target = match (w & 0xFFFF) as isize {
-                    SB_LINEUP => y - step,
-                    SB_LINEDOWN => y + step,
-                    SB_PAGEUP => y - view_h,
-                    SB_PAGEDOWN => y + view_h,
-                    SB_TOP => 0,
-                    SB_BOTTOM => i32::MAX / 2,
-                    SB_THUMBTRACK | SB_THUMBPOSITION => {
-                        let mut info: SCROLLINFO = unsafe { std::mem::zeroed() };
-                        info.cbSize = std::mem::size_of::<SCROLLINFO>() as u32;
-                        info.fMask = SIF_TRACKPOS;
-                        unsafe { GetScrollInfo(pane, SB_VERT as i32, &mut info) };
-                        geom::logical(info.nTrackPos)
-                    }
-                    _ => return Some(0),
-                };
-                self.scroll_pane_to(target);
-                Some(0)
-            }
-            _ => None,
-        }
+            .into(),
+        );
+        ui.set_can_optimize(idle && selected > 0 && !settings.formats().is_empty());
+        ui.set_progress(progress);
+        ui.set_has_output(has_output);
+        ui.set_status(status.into());
+        let pct = settings.resize_percent;
+        let side = |s: u32| ((s as f64 * pct as f64 / 100.0).round() as u32).max(1);
+        ui.set_resize_hint(format!("Example: 4000 × 3000 → {} × {}", side(4000), side(3000)).into());
     }
 
     // -------------------------------------------------------------- settings
 
     fn apply_settings(&self, s: &Settings) {
-        let c = &self.c;
-        set_checked(&c.jpeg, s.jpeg);
-        set_checked(&c.webp, s.webp);
-        set_checked(&c.avif, s.avif);
-        set_checked(&c.png, s.png);
-        c.jpeg_quality.set(s.jpeg_quality as u32);
-        c.webp_quality.set(s.webp_quality as u32);
-        set_checked(&c.webp_lossless, s.webp_lossless);
-        c.avif_quality.set(s.avif_quality as u32);
-        c.avif_speed.set(s.avif_speed as u32);
-        c.png_level.set(s.png_level as u32);
-        set_checked(&c.resize, s.resize);
+        let ui = &self.ui;
+        ui.set_jpeg(s.jpeg);
+        ui.set_webp(s.webp);
+        ui.set_avif(s.avif);
+        ui.set_png(s.png);
+        ui.set_jpeg_quality(s.jpeg_quality as f32);
+        ui.set_webp_quality(s.webp_quality as f32);
+        ui.set_webp_lossless(s.webp_lossless);
+        ui.set_avif_quality(s.avif_quality as f32);
+        ui.set_avif_speed(s.avif_speed as f32);
+        ui.set_png_level(s.png_level as f32);
+        ui.set_resize(s.resize);
         let percent = s.resize_percent.clamp(1, 100);
-        c.resize_mode.set_selection(Some(match s.resize_mode {
+        ui.set_resize_mode(match s.resize_mode {
             ResizeMode::FitWithin => 0,
-            ResizeMode::Percent => PERCENT_PRESETS.iter().position(|p| *p == percent).map_or(4, |i| i + 1),
-        }));
-        c.percent.set_text(&percent.to_string());
-        c.max_width.set_text(&s.max_width.to_string());
-        c.max_height.set_text(&s.max_height.to_string());
+            ResizeMode::Percent => PERCENT_PRESETS.iter().position(|p| *p == percent).map_or(4, |i| i as i32 + 1),
+        });
+        ui.set_percent(percent.to_string().into());
+        ui.set_limit_width(s.max_width.to_string().into());
+        ui.set_limit_height(s.max_height.to_string().into());
         match &s.output {
-            OutputLocation::Subfolder => c.save_mode.set_selection(Some(0)),
+            OutputLocation::Subfolder => ui.set_save_mode(0),
             OutputLocation::Custom(dir) => {
-                c.save_mode.set_selection(Some(1));
-                c.output_dir.set_text(&dir.display().to_string());
+                ui.set_save_mode(1);
+                ui.set_output_dir(dir.display().to_string().into());
             }
         }
-        set_checked(&c.skip_larger, s.skip_if_larger);
-        set_checked(&c.overwrite, s.overwrite);
+        ui.set_skip_larger(s.skip_if_larger);
+        ui.set_overwrite(s.overwrite);
     }
 
     fn read_settings(&self) -> Settings {
-        let c = &self.c;
-        let num = |t: &nwg::TextInput, default: u32| t.text().trim().parse::<u32>().unwrap_or(default);
-        let custom_percent = num(&c.percent, 50).clamp(1, 100);
-        let (resize_mode, resize_percent) = match c.resize_mode.selection().unwrap_or(0) {
+        let ui = &self.ui;
+        let num = |t: slint::SharedString, default: u32| t.trim().parse::<u32>().unwrap_or(default);
+        let custom_percent = num(ui.get_percent(), 50).clamp(1, 100);
+        let (resize_mode, resize_percent) = match ui.get_resize_mode() {
             0 => (ResizeMode::FitWithin, custom_percent),
-            i @ 1..=3 => (ResizeMode::Percent, PERCENT_PRESETS[i - 1]),
+            i @ 1..=3 => (ResizeMode::Percent, PERCENT_PRESETS[i as usize - 1]),
             _ => (ResizeMode::Percent, custom_percent),
         };
-        let dir = c.output_dir.text();
+        let slider = |v: f32, lo: f32, hi: f32| v.round().clamp(lo, hi) as u8;
+        let dir = ui.get_output_dir().trim().to_string();
         Settings {
-            jpeg: checked(&c.jpeg),
-            webp: checked(&c.webp),
-            avif: checked(&c.avif),
-            png: checked(&c.png),
-            jpeg_quality: c.jpeg_quality.get().clamp(1, 100) as u8,
-            webp_quality: c.webp_quality.get().clamp(1, 100) as u8,
-            webp_lossless: checked(&c.webp_lossless),
-            avif_quality: c.avif_quality.get().clamp(1, 100) as u8,
-            avif_speed: c.avif_speed.get().clamp(1, 10) as u8,
-            png_level: c.png_level.get().min(6) as u8,
-            resize: checked(&c.resize),
+            jpeg: ui.get_jpeg(),
+            webp: ui.get_webp(),
+            avif: ui.get_avif(),
+            png: ui.get_png(),
+            jpeg_quality: slider(ui.get_jpeg_quality(), 1.0, 100.0),
+            webp_quality: slider(ui.get_webp_quality(), 1.0, 100.0),
+            webp_lossless: ui.get_webp_lossless(),
+            avif_quality: slider(ui.get_avif_quality(), 1.0, 100.0),
+            avif_speed: slider(ui.get_avif_speed(), 1.0, 10.0),
+            png_level: slider(ui.get_png_level(), 0.0, 6.0),
+            resize: ui.get_resize(),
             resize_mode,
             resize_percent,
-            max_width: num(&c.max_width, 0),
-            max_height: num(&c.max_height, 0),
-            output: if c.save_mode.selection() == Some(1) && !dir.is_empty() {
+            max_width: num(ui.get_limit_width(), 0),
+            max_height: num(ui.get_limit_height(), 0),
+            output: if ui.get_save_mode() == 1 && !dir.is_empty() {
                 OutputLocation::Custom(PathBuf::from(dir))
             } else {
                 OutputLocation::Subfolder
             },
-            skip_if_larger: checked(&c.skip_larger),
-            overwrite: checked(&c.overwrite),
+            skip_if_larger: ui.get_skip_larger(),
+            overwrite: ui.get_overwrite(),
         }
     }
-}
-
-fn is_immersive_color_change(l: LPARAM) -> bool {
-    if l == 0 {
-        return false;
-    }
-    let text = unsafe {
-        let p = l as *const u16;
-        let len = (0..64).take_while(|&i| *p.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
-    };
-    text == "ImmersiveColorSet"
 }
 
 fn status_text(st: &State) -> String {
@@ -1056,34 +740,80 @@ fn new_job(id: u64, source: Source) -> Job {
         original_size,
         status: Status::Pending,
         selected: true,
-        thumb: tiles::PLACEHOLDER,
-        info: None,
+        thumb: None,
+        meta: Meta::Loading,
+        run_dims: None,
     }
 }
 
-fn tile_view(job: &Job, plan: &str) -> TileView {
+/// Tile tones and badges (see `TileData` in ui/app.slint).
+const TONE_NORMAL: i32 = 0;
+const TONE_SUCCESS: i32 = 1;
+const TONE_CAUTION: i32 = 2;
+const TONE_CRITICAL: i32 = 3;
+const BADGE_NONE: i32 = 0;
+const BADGE_DONE: i32 = 1;
+const BADGE_RUNNING: i32 = 2;
+const BADGE_SKIPPED: i32 = 3;
+const BADGE_ERROR: i32 = 4;
+
+/// `settings` are the current ones: images that haven't run yet show what they would produce.
+fn tile_view(job: &Job, plan: &str, settings: &Settings) -> TileData {
     let results: &[FormatResult] = match &job.status {
         Status::Done(r) => r,
         _ => &[],
     };
-    let details = match &job.info {
-        Some(info) => format!("{info} · {}", human_size(job.original_size)),
-        None => human_size(job.original_size),
+    let details = match job.meta {
+        Meta::Loading => "Reading…",
+        Meta::Read { format, .. } => format,
+        Meta::Unreadable => "Can't read this image",
     };
+
+    // Original / Output columns.
+    let dims = |(w, h): (u32, u32)| format!("{w} × {h}");
+    let (orig_dims, out_dims) = match job.meta {
+        Meta::Read { width, height, .. } => {
+            // Waiting images follow the current settings; others show what their run used.
+            let target = match job.status {
+                Status::Pending => optimizer::target_size(width, height, settings),
+                _ => job.run_dims,
+            };
+            (dims((width, height)), target)
+        }
+        Meta::Loading => ("…".to_string(), None),
+        Meta::Unreadable => ("—".to_string(), None),
+    };
+    let smallest = results
+        .iter()
+        .filter_map(|r| match r.outcome {
+            Outcome::Written { size, .. } => Some(size),
+            _ => None,
+        })
+        .min();
+    let (out_size, out_tone) = match (&job.status, smallest) {
+        (Status::Done(_), Some(size)) => (human_size(size), TONE_SUCCESS),
+        (Status::Done(_), None) if results.iter().any(|r| matches!(r.outcome, Outcome::Larger { .. })) => {
+            ("skipped".to_string(), TONE_CAUTION)
+        }
+        (Status::Done(_), None) | (Status::Failed(_), _) => ("failed".to_string(), TONE_CRITICAL),
+        (Status::Running, _) => ("…".to_string(), TONE_NORMAL),
+        (Status::Pending, _) => ("—".to_string(), TONE_NORMAL),
+    };
+
     let written = results.iter().any(|r| matches!(r.outcome, Outcome::Written { .. }));
     let error = row_error(job);
     let (output, tone, badge) = match &job.status {
-        Status::Pending if !job.selected => ("Not selected".to_string(), Tone::Normal, Badge::None),
-        Status::Pending => (plan.to_string(), Tone::Normal, Badge::None),
-        Status::Running => ("Optimizing…".to_string(), Tone::Normal, Badge::Running),
-        Status::Failed(_) => ("Couldn't optimize this image".to_string(), Tone::Critical, Badge::Error),
+        Status::Pending if !job.selected => ("Not selected".to_string(), TONE_NORMAL, BADGE_NONE),
+        Status::Pending => (plan.to_string(), TONE_NORMAL, BADGE_NONE),
+        Status::Running => ("Optimizing…".to_string(), TONE_NORMAL, BADGE_RUNNING),
+        Status::Failed(_) => ("Couldn't optimize this image".to_string(), TONE_CRITICAL, BADGE_ERROR),
         Status::Done(_) => {
             let (tone, badge) = if error.is_some() {
-                (Tone::Critical, Badge::Error)
+                (TONE_CRITICAL, BADGE_ERROR)
             } else if written {
-                (Tone::Success, Badge::Done)
+                (TONE_SUCCESS, BADGE_DONE)
             } else {
-                (Tone::Caution, Badge::Skipped)
+                (TONE_CAUTION, BADGE_SKIPPED)
             };
             (result_text(results, job.original_size), tone, badge)
         }
@@ -1099,13 +829,23 @@ fn tile_view(job: &Job, plan: &str) -> TileView {
             })
             .unwrap_or_else(|| job.folder.clone()),
     };
-    TileView {
-        texts: [job.file_name.clone(), details, output, location],
+    TileData {
+        name: job.file_name.as_str().into(),
+        details: details.into(),
+        output: output.into(),
+        location: location.into(),
         tone,
-        running: matches!(job.status, Status::Running),
-        thumb: job.thumb,
         badge,
+        running: matches!(job.status, Status::Running),
         selected: job.selected,
+        thumb: job.thumb.clone().unwrap_or_default(),
+        has_thumb: job.thumb.is_some(),
+        orig_dims: orig_dims.into(),
+        orig_size: human_size(job.original_size).into(),
+        out_resized: out_dims.is_some(),
+        out_dims: out_dims.map_or_else(|| "same".to_string(), dims).into(),
+        out_size: out_size.into(),
+        out_tone,
     }
 }
 
@@ -1185,19 +925,19 @@ fn totals(jobs: &[Job]) -> Option<(u64, u64)> {
     any.then_some((orig, best))
 }
 
-fn run_jobs(work: Vec<(usize, Source)>, settings: Settings, cancel: Arc<AtomicBool>, tx: Sender<Msg>, notice: nwg::NoticeSender) {
+fn run_jobs(work: Vec<(usize, Source)>, settings: Settings, cancel: Arc<AtomicBool>, tx: Sender<Msg>, waker: Waker) {
     work.into_par_iter().for_each_with(tx.clone(), |tx, (i, source)| {
         if cancel.load(Ordering::SeqCst) {
             return;
         }
         let _ = tx.send(Msg::Started(i));
-        notice.notice();
+        waker.wake();
         let result = optimizer::process(&source, &settings).map_err(|e| format!("{e:#}"));
         let _ = tx.send(Msg::Finished(i, result));
-        notice.notice();
+        waker.wake();
     });
     let _ = tx.send(Msg::AllDone);
-    notice.notice();
+    waker.wake();
 }
 
 // ------------------------------------------------------------------ settings file
@@ -1248,153 +988,71 @@ fn open_in_explorer(dir: &Path) {
     let _ = std::process::Command::new("explorer").arg(dir).spawn();
 }
 
-/// Debug-only self-check: with `GIO_SNAPSHOT=<file.png>` the app renders its own window
-/// to a PNG and exits (`GIO_SNAPSHOT_RUN=1` optimizes the loaded files first,
-/// `GIO_SNAPSHOT_UNCHECK=n` unticks row n first, `GIO_THEME=dark|light` forces a theme).
+/// Debug self-check: with `GIO_SNAPSHOT=<file.png>` the app renders its own window to a PNG
+/// and exits.
+/// - `GIO_SNAPSHOT_RUN=1` optimizes the loaded files first (`GIO_SNAPSHOT_MIDRUN=<ms>`
+///   captures that long after the run starts instead of at the end);
+/// - `GIO_SNAPSHOT_ALL_ON=1` switches every format and resizing on first;
+/// - `GIO_THEME=dark|light` forces a theme.
 #[cfg(any(debug_assertions, feature = "snapshot"))]
 mod snapshot {
     use super::*;
 
-    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn var(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.is_empty())
+    }
 
-    pub fn schedule(notice: &nwg::Notice) {
-        if std::env::var_os("GIO_SNAPSHOT").is_none() {
+    pub fn schedule() {
+        if var("GIO_SNAPSHOT").is_none() {
             return;
         }
-        // Give the window time to paint before capturing (PrintWindow returns the last frame).
-        let sender = notice.sender();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(2000));
-            sender.notice();
+        if var("GIO_SNAPSHOT_ALL_ON").is_some() {
+            with_app(|a| {
+                let ui = &a.ui;
+                for set in [AppWindow::set_webp, AppWindow::set_avif, AppWindow::set_jpeg, AppWindow::set_png, AppWindow::set_resize] {
+                    set(ui, true);
+                }
+                a.sync();
+            });
+        }
+        // Give thumbnails time to load and the window time to render.
+        slint::Timer::single_shot(Duration::from_millis(1500), || {
+            if var("GIO_SNAPSHOT_RUN").is_some() {
+                with_app(App::start);
+            } else {
+                capture();
+            }
         });
     }
 
-    /// GIO_BENCH_RESIZE=1: resize the window step by step, painting each frame, and report
-    /// the average time per frame (what interactive resizing costs).
-    fn bench_resize(app: &App) {
-        use winapi::um::winuser::{GetWindowRect, RDW_ALLCHILDREN, RDW_UPDATENOW, RedrawWindow, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos};
-        let Some(hwnd) = app.c.window.handle.hwnd() else { return };
-        let mut rc = unsafe { std::mem::zeroed() };
-        unsafe { GetWindowRect(hwnd, &mut rc) };
-        let (w0, h0) = (rc.right - rc.left, rc.bottom - rc.top);
-        let steps = 60;
-        let start = std::time::Instant::now();
-        let mut worst = std::time::Duration::ZERO;
-        let (mut layout, mut paint) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-        for i in 0..steps {
-            let d = (i % 30) * 6;
-            let t = std::time::Instant::now();
-            unsafe { SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, w0 - d, h0 - d / 2, SWP_NOMOVE | SWP_NOZORDER) };
-            let t2 = std::time::Instant::now();
-            unsafe { RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN) };
-            layout += t2 - t;
-            paint += t2.elapsed();
-            worst = worst.max(t.elapsed());
-        }
-        let n = steps as u32;
-        println!("bench: resize {steps} frames, avg {:?}/frame (layout {:?}, paint {:?}), worst {:?}", start.elapsed() / n, layout / n, paint / n, worst);
-        app.c.window.close();
-    }
-
-    pub fn on_notice(app: &App) {
-        if std::env::var_os("GIO_BENCH_RESIZE").is_some() {
-            bench_resize(app);
-            return;
-        }
-        // GIO_SNAPSHOT_ALL_ON=1 turns every format and Resize on; GIO_SNAPSHOT_SCROLL=n scrolls
-        // the settings pane n logical pixels (both before capturing).
-        if std::env::var_os("GIO_SNAPSHOT_ALL_ON").is_some() {
-            for t in [&app.c.webp, &app.c.avif, &app.c.jpeg, &app.c.png, &app.c.resize] {
-                set_checked(t, true);
-            }
-            app.sync_controls();
-        }
-        if let Some(y) = std::env::var("GIO_SNAPSHOT_SCROLL").ok().and_then(|v| v.parse().ok()) {
-            app.scroll_pane_to(y);
-        }
-        if std::env::var_os("GIO_SNAPSHOT_RUN").is_some() && !STARTED.swap(true, Ordering::SeqCst) {
-            if let Some(row) = std::env::var("GIO_SNAPSHOT_UNCHECK").ok().and_then(|v| v.parse().ok()) {
-                app.tiles.set_checked(row, false);
-                app.on_checks_changed();
-            }
-            app.start();
-            // GIO_SNAPSHOT_MIDRUN=ms captures while optimizing instead of after.
-            if let Some(ms) = std::env::var("GIO_SNAPSHOT_MIDRUN").ok().and_then(|v| v.parse::<u64>().ok()) {
-                let sender = app.c.snapshot_notice.sender();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(ms));
-                    sender.notice();
-                });
-            }
-        } else {
-            capture_and_exit(app);
+    pub fn on_run_started() {
+        if let Some(ms) = var("GIO_SNAPSHOT_MIDRUN").and_then(|v| v.parse::<u64>().ok()) {
+            slint::Timer::single_shot(Duration::from_millis(ms), capture);
         }
     }
 
-    pub fn on_run_finished(app: &App) {
-        if std::env::var_os("GIO_SNAPSHOT").is_some() {
-            schedule(&app.c.snapshot_notice);
+    pub fn on_run_finished() {
+        if var("GIO_SNAPSHOT").is_some() && var("GIO_SNAPSHOT_MIDRUN").is_none() {
+            // Let the final state render first.
+            slint::Timer::single_shot(Duration::from_millis(400), capture);
         }
     }
 
-    fn capture_and_exit(app: &App) {
-        let rows = app.state.borrow().jobs.len();
-        if rows > 0 {
-            let ok = (0..rows).filter(|&r| app.tiles.checkbox_hit_ok(r)).count();
-            println!("snapshot: tile checkbox hit-test {ok}/{rows} rows land on the list view's checkbox");
-        }
-        if let (Some(path), Some(hwnd)) = (std::env::var_os("GIO_SNAPSHOT"), app.c.window.handle.hwnd()) {
-            // Finish any pending painting first, so the capture shows the current state.
-            // GIO_SNAPSHOT_RAW=1 skips this, to see exactly what is on screen.
-            if std::env::var_os("GIO_SNAPSHOT_RAW").is_none() { unsafe {
-                use winapi::um::winuser::{RDW_ALLCHILDREN, RDW_UPDATENOW, RedrawWindow};
-                RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN);
-            } }
-            match capture(hwnd) {
-                Some(img) => match img.save(&path) {
-                    Ok(()) => println!("snapshot: wrote {}", PathBuf::from(&path).display()),
-                    Err(e) => eprintln!("snapshot: {e}"),
-                },
-                None => eprintln!("snapshot: capture failed"),
+    fn capture() {
+        let Some(path) = var("GIO_SNAPSHOT") else { return };
+        with_app(|a| {
+            match a.ui.window().take_snapshot() {
+                Ok(buf) => {
+                    let (w, h) = (buf.width(), buf.height());
+                    match image::RgbaImage::from_raw(w, h, buf.as_bytes().to_vec()).map(|img| img.save(&path)) {
+                        Some(Ok(())) => eprintln!("snapshot: wrote {path}"),
+                        Some(Err(e)) => eprintln!("snapshot: {e}"),
+                        None => eprintln!("snapshot: bad buffer"),
+                    }
+                }
+                Err(e) => eprintln!("snapshot: {e}"),
             }
-        }
-        app.c.window.close();
-    }
-
-    /// Render this app's own window (not the screen) with PrintWindow.
-    fn capture(hwnd: winapi::shared::windef::HWND) -> Option<image::RgbaImage> {
-        use winapi::um::wingdi::*;
-        use winapi::um::winuser::{GetDC, GetWindowRect, PrintWindow, ReleaseDC};
-        unsafe {
-            let mut rc = std::mem::zeroed();
-            GetWindowRect(hwnd, &mut rc);
-            let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-            let screen = GetDC(std::ptr::null_mut());
-            let mem = CreateCompatibleDC(screen);
-            let bmp = CreateCompatibleBitmap(screen, w, h);
-            let old = SelectObject(mem, bmp as _);
-            let ok = PrintWindow(hwnd, mem, 2 /* PW_RENDERFULLCONTENT */) != 0;
-            let mut info: BITMAPINFO = std::mem::zeroed();
-            info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-            info.bmiHeader.biWidth = w;
-            info.bmiHeader.biHeight = -h;
-            info.bmiHeader.biPlanes = 1;
-            info.bmiHeader.biBitCount = 32;
-            info.bmiHeader.biCompression = BI_RGB;
-            let mut buf = vec![0u8; (w * h * 4) as usize];
-            GetDIBits(mem, bmp, 0, h as u32, buf.as_mut_ptr() as _, &mut info, DIB_RGB_COLORS);
-            SelectObject(mem, old);
-            DeleteObject(bmp as _);
-            DeleteDC(mem);
-            ReleaseDC(std::ptr::null_mut(), screen);
-            if !ok {
-                return None;
-            }
-            for px in buf.as_chunks_mut::<4>().0 {
-                px.swap(0, 2);
-                px[3] = 255;
-            }
-            image::RgbaImage::from_raw(w as u32, h as u32, buf)
-        }
+        });
+        let _ = slint::quit_event_loop();
     }
 }

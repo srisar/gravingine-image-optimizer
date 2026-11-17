@@ -1,19 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // no console window in release
 
+slint::include_modules!();
+
 mod app;
-mod draw;
-mod geom;
-mod droptarget;
-mod icons;
 mod optimizer;
-mod skin;
 mod taskbar;
-mod theme;
-mod tiles;
-mod ui;
+mod winicon;
 
 fn main() {
     if let Err(e) = app::run() {
-        native_windows_gui::fatal_message("Gravingine Image Optimizer", &format!("Could not start: {e}"));
+        rfd::MessageDialog::new()
+            .set_title("Gravingine Image Optimizer")
+            .set_description(format!("Could not start: {e}"))
+            .set_level(rfd::MessageLevel::Error)
+            .show();
     }
 }
