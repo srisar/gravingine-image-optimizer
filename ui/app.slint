@@ -1247,43 +1247,29 @@ component CompareView inherits Rectangle {
     }
 }
 
-// A label in spaced-out capitals ("IMAGE OPTIMIZER", "MADE BY").
-component Eyebrow inherits Text {
-    font-family: "Consolas";
-    font-size: 13px;
-    letter-spacing: 4px;
-    color: Ui.secondary;
-}
-
-// An underlined link with an "open in new window" mark.
+// A link to a web page: accent text with an "open in new window" mark, brighter on hover.
 component Link {
     in property <string> text;
     callback clicked;
+
+    private property <brush> color: touch.has-hover ? Palette.accent-background.brighter(0.25) : Palette.accent-background;
 
     accessible-role: button;
     accessible-label: root.text;
     accessible-action-default => { root.clicked(); }
 
     HorizontalLayout {
-        spacing: 6px;
-        VerticalLayout {
-            alignment: center;
-            spacing: 1px;
-            Text {
-                text: root.text;
-                font-family: "Consolas";
-                font-size: 15px;
-                color: touch.has-hover ? Palette.accent-background : Palette.foreground;
-            }
-            Rectangle {
-                height: 1px;
-                background: touch.has-hover ? Palette.accent-background : Palette.foreground;
-            }
+        spacing: 5px;
+        Text {
+            text: root.text;
+            font-size: 13px;
+            color: root.color;
+            vertical-alignment: center;
         }
         Icon {
             glyph: Glyph.open-new;
-            font-size: 12px;
-            color: touch.has-hover ? Palette.accent-background : Palette.foreground;
+            font-size: 11px;
+            color: root.color;
         }
     }
     touch := TouchArea {
@@ -1485,7 +1471,7 @@ component AboutDialog inherits Rectangle {
     init => { keys.focus(); }
 
     card := Rectangle {
-        width: min(560px, root.width - 32px);
+        width: min(root.licenses ? 560px : 480px, root.width - 32px);
         height: min(content.preferred-height, root.height - 32px);
         x: (root.width - self.width) / 2;
         y: (root.height - self.height) / 2;
@@ -1499,15 +1485,138 @@ component AboutDialog inherits Rectangle {
         TouchArea { }
 
         content := VerticalLayout {
-            // ---- title bar
-            Rectangle {
+            // ---- the app: logo, name and version, then what can be done from here
+            if !root.licenses: VerticalLayout {
+                padding-left: 24px;
+                padding-right: 12px;
+                padding-top: 12px;
+                padding-bottom: 20px;
+                spacing: 18px;
+                HorizontalLayout {
+                    spacing: 16px;
+                    VerticalLayout {
+                        alignment: center;
+                        padding-top: 8px;
+                        Rectangle {
+                            width: 64px;
+                            height: 64px;
+                            border-radius: 16px;
+                            background: Palette.control-background;
+                            Image {
+                                source: @image-url("../res/gravingine-logo.svg");
+                                width: 44px;
+                                height: 44px;
+                                accessible-role: image;
+                                accessible-label: "Gravingine logo";
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        padding-top: 8px;
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: "Gravingine Image Optimizer";
+                            font-size: 18px;
+                            font-weight: 600;
+                            color: Palette.foreground;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "Version " + root.version + " · build " + root.build;
+                            font-size: 12px;
+                            color: Ui.secondary;
+                            wrap: word-wrap;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: start;
+                        GlyphButton {
+                            glyph: Glyph.cancel;
+                            accessible-label: "Close";
+                            clicked => { root.close(); }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: 8px;
+                    GlyphButton {
+                        text: "Check for updates";
+                        primary: true;
+                        clicked => { root.check-updates(); }
+                    }
+                    GlyphButton {
+                        text: "Licenses";
+                        clicked => { root.licenses = true; }
+                    }
+                    GlyphButton {
+                        glyph: Glyph.open-new;
+                        text: "Source code";
+                        clicked => { root.open-source(); }
+                    }
+                }
+            }
+
+            // ---- the maker
+            if !root.licenses: Rectangle {
+                height: 1px;
+                background: Ui.card-border;
+            }
+            if !root.licenses: Rectangle {
+                background: Palette.background;
+                HorizontalLayout {
+                    padding-left: 24px;
+                    padding-right: 24px;
+                    padding-top: 14px;
+                    padding-bottom: 14px;
+                    spacing: 12px;
+                    VerticalLayout {
+                        alignment: center;
+                        Image {
+                            source: @image-url("../res/gravitide-icon.svg");
+                            width: 32px;
+                            height: 32px;
+                            accessible-role: image;
+                            accessible-label: "Gravitide logo";
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 1px;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: "Made by Gravitide";
+                            font-size: 13px;
+                            color: Palette.foreground;
+                        }
+                        Text {
+                            text: "© 2026 Gravitide Pvt Ltd · MIT license";
+                            font-size: 12px;
+                            color: Ui.secondary;
+                            wrap: word-wrap;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Link {
+                            text: "gravitide.dev";
+                            clicked => { root.open-website(); }
+                        }
+                    }
+                }
+            }
+
+            // ---- the Licenses view's title bar
+            if root.licenses: Rectangle {
                 height: 56px;
                 background: Palette.control-background;
                 HorizontalLayout {
-                    padding-left: root.licenses ? 10px : 22px;
+                    padding-left: 10px;
                     padding-right: 12px;
                     spacing: 6px;
-                    if root.licenses: VerticalLayout {
+                    VerticalLayout {
                         alignment: center;
                         GlyphButton {
                             glyph: Glyph.chevron-left;
@@ -1516,7 +1625,7 @@ component AboutDialog inherits Rectangle {
                         }
                     }
                     Text {
-                        text: root.licenses ? "Licenses" : "About Gravingine";
+                        text: "Licenses";
                         font-size: 16px;
                         font-weight: 600;
                         color: Palette.foreground;
@@ -1533,117 +1642,9 @@ component AboutDialog inherits Rectangle {
                     }
                 }
             }
-            Rectangle {
+            if root.licenses: Rectangle {
                 height: 1px;
                 background: Ui.card-border;
-            }
-
-            // ---- the app
-            if !root.licenses: VerticalLayout {
-                padding: 32px;
-                padding-top: 40px;
-                spacing: 0px;
-                HorizontalLayout {
-                    alignment: center;
-                    Image {
-                        source: @image-url("../res/gravingine-logo.svg");
-                        width: 104px;
-                        height: 104px;
-                        accessible-role: image;
-                        accessible-label: "Gravingine logo";
-                    }
-                }
-                Text {
-                    text: "Gravingine";
-                    font-size: 50px;
-                    font-weight: 700;
-                    color: Palette.foreground;
-                    horizontal-alignment: center;
-                }
-                Eyebrow {
-                    text: "IMAGE OPTIMIZER";
-                    font-size: 16px;
-                    letter-spacing: 7px;
-                    horizontal-alignment: center;
-                }
-                Rectangle { height: 26px; }
-                HorizontalLayout {
-                    alignment: center;
-                    Rectangle {
-                        height: 38px;
-                        width: version-text.preferred-width + 40px;
-                        border-radius: 19px;
-                        border-width: 1px;
-                        border-color: Ui.card-border;
-                        background: Palette.background;
-                        version-text := Text {
-                            text: "Version " + root.version + " · Build " + root.build;
-                            font-family: "Consolas";
-                            font-size: 14px;
-                            color: Palette.foreground;
-                        }
-                    }
-                }
-                Rectangle { height: 26px; }
-                HorizontalLayout {
-                    alignment: center;
-                    spacing: 12px;
-                    GlyphButton {
-                        text: "Check for updates";
-                        primary: true;
-                        clicked => { root.check-updates(); }
-                    }
-                    GlyphButton {
-                        text: "Licenses";
-                        clicked => { root.licenses = true; }
-                    }
-                }
-            }
-
-            // ---- the maker
-            if !root.licenses: Rectangle {
-                background: Palette.background;
-                VerticalLayout {
-                    padding: 24px;
-                    padding-left: 28px;
-                    padding-right: 28px;
-                    spacing: 16px;
-                    HorizontalLayout {
-                        spacing: 16px;
-                        VerticalLayout {
-                            alignment: center;
-                            Image {
-                                source: @image-url("../res/gravitide-icon.svg");
-                                width: 60px;
-                                height: 60px;
-                                accessible-role: image;
-                                accessible-label: "Gravitide logo";
-                            }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 2px;
-                            Eyebrow { text: "MADE BY"; }
-                            Text {
-                                text: "Gravitide";
-                                font-size: 24px;
-                                font-weight: 700;
-                                color: Palette.foreground;
-                            }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        Link {
-                            text: "gravitide.dev";
-                            clicked => { root.open-website(); }
-                        }
-                    }
-                    Text {
-                        text: "© 2026 Gravitide Pvt Ltd. Free and open source under the MIT license.";
-                        font-size: 12px;
-                        color: Ui.secondary;
-                        wrap: word-wrap;
-                    }
-                }
             }
 
             // ---- licenses
