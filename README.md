@@ -18,7 +18,10 @@ smaller files.
   | PNG  | oxipng (lossless) | Re-compresses PNGs in place when not resized |
 - **Resize** with presets: Thumbnails (230 × 230), Small (640 × 480), Medium (800 × 600), Large (1024 × 768), HD (1920 × 1080) and 4K (3840 × 2160), which fit the image within the size turned to its orientation (a portrait photo fits 480 × 640 for Small); or reduce to 25%, 50% or 75%; or a custom maximum width/height or percentage. The aspect ratio is kept and images are never enlarged.
 - **Target file size** (e.g. "keep each file under 200 KB"): for JPEG, lossy WebP and AVIF, a binary search over quality picks the highest quality that fits (within 2 points, from 100% down to 10%; the quality sliders are set aside while a target is on). With *Skip files larger than the original* on, it also stays smaller than the original, so the output isn't thrown away. Tiles and the preview show the quality picked ("WebP 196.8 KB at 71%"); an image that doesn't fit even at 10% is still saved, at its smallest, and flagged in amber. PNG and lossless WebP aren't changed. Presets can include a target.
-- Strips metadata (EXIF/GPS) and bakes in EXIF orientation.
+- **Color profile and metadata** (settings, under *Advanced settings* at the bottom):
+  - *Color profile*: **Keep** (default) embeds a wide-gamut profile (Display P3, Adobe RGB...) in JPEG, WebP and PNG, so those photos keep their colors; an sRGB profile is left out since untagged images are read as sRGB anyway. AVIF, whose encoder can't embed a profile, is converted to sRGB. **Convert to sRGB** converts the pixels (with [moxcms](https://github.com/awxkee/moxcms)) and embeds no profile. Previews and thumbnails are color-managed either way.
+  - *Metadata*: **Remove all** (default), **Keep, except location** (camera, lens, exposure, dates, author, copyright) or **Keep all** (with GPS). The EXIF block is rebuilt rather than copied: maker notes and the embedded thumbnail are always dropped, as are XMP and IPTC, and the pixel dimensions are updated. It counts toward a target file size.
+  - EXIF orientation is always applied to the pixels (and never written), so photos come out upright. AVIF inputs' own profile and metadata aren't read.
 - *Skip outputs larger than the original* so you never end up with a worse file.
 - *Clear images from the list once optimized* (under *Save to*): after a run, images that optimized cleanly leave the list and their savings go into the status line; images with errors or a missed target size stay, so you can look at them.
 - File list as tiles: thumbnail with a status badge, file name and format, what will be produced (or the colored result) and where it was saved, with a progress bar while optimizing. On the right, *Original* and *Output* columns: dimensions and file size before, and the resized dimensions and smallest saved size after. Tick the images to process with their checkboxes; *Select all* / *Select none*.
@@ -28,7 +31,7 @@ smaller files.
 - *About* (top right): the Gravingine logo, version and build (commit and date), *Check for updates* (opens the GitHub releases), and Gravitide with a link to gravitide.dev. *Licenses* lists the open-source parts used, with the Slint attribution its royalty-free license asks for.
 - Slint UI (Cosmic style):
   - follows Windows' **light/dark mode**, live, and tints its accent from the Windows **accent color**; the title bar matches the window;
-  - a scrolling settings pane: each output format (and resizing) is its own card with a tinted icon, a short description and a switch; a format's sliders slide open inside its card while it is switched on;
+  - a scrolling settings pane: each output format (and resizing) is its own card with a tinted icon, a short description and a switch; a format's sliders slide open inside its card while it is switched on; *Target file size* and *Color profile and metadata* have a *How it works* link that opens a short guide;
   - the file list highlights while files are dragged over the window;
   - scales per monitor; icons are glyphs from the Windows icon font (Segoe Fluent Icons, or Segoe MDL2 Assets on Windows 10). The window and taskbar icon is the Gravingine logo, drawn at runtime.
 
@@ -102,6 +105,7 @@ may warn on first launch.
 - `ui/app.slint` – the whole window: settings cards, file list tiles, toolbar and footer (compiled by `build.rs` with the Cosmic style)
 - `src/app.rs` – app state and behavior: adding images, thumbnails, selection, runs, window events
 - `src/optimizer.rs` – decoding, resizing and encoding
+- `src/metadata.rs` – color profiles (sRGB detection and conversion) and EXIF (rebuilt with only the fields kept), and adding them to JPEG, WebP and PNG files
 - `src/presets.rs` – settings presets: the built-in ones, matching settings to a preset, and the user's own in `presets.json`
 - `src/taskbar.rs` – taskbar button progress and flash
 - `src/logo.rs` – draws the Gravingine logo: the window icon, and (via `build.rs`) the exe's embedded `.ico`
@@ -127,6 +131,9 @@ GIO_SNAPSHOT=window.png GIO_SNAPSHOT_PRESET_DIALOG=1 cargo run   # the "Save as 
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_SAVE_PRESET="My blog" cargo run   # save the settings as a preset (not written to disk)
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_TARGET=200 GIO_SNAPSHOT_RUN=1 cargo run -- "D:\Photos"   # target file size on, at 200 KB
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_SCROLL=820 cargo run   # scroll the settings pane down 820 px
+GIO_SNAPSHOT=window.png GIO_SNAPSHOT_METADATA=1 GIO_SNAPSHOT_SCROLL=2000 cargo run   # metadata "Keep, except location" (GIO_SNAPSHOT_COLOR=1: Convert to sRGB)
+GIO_SNAPSHOT=window.png GIO_SNAPSHOT_SCROLL=2000 GIO_SNAPSHOT_CLICK=225,700 cargo run   # click at (225, 700) logical px first, e.g. to open the Metadata drop-down list
+GIO_SNAPSHOT=window.png GIO_SNAPSHOT_INFO=1 cargo run   # a "How it works" dialog (1 target file size, 2 color profile and metadata)
 # Snapshot runs leave "Clear images ... once optimized" off unless GIO_SNAPSHOT_CLEAR=1.
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_COMPARE=0 cargo run -- "D:\Photos"   # run, then open the comparison for the first image
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_COMPARE=0 GIO_SNAPSHOT_ZOOM=100 GIO_SNAPSHOT_SPLIT=0.3 cargo run -- "D:\Photos"   # ...at 100% (or 25, 50, 75), line at 30%

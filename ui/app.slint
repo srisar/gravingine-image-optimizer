@@ -2,7 +2,7 @@
 // Colors come from the style's Palette (which follows Windows' light/dark mode and tints its
 // accent from the Windows accent color); icons are glyphs from the Windows icon font.
 
-import { AboutSlint, CheckBox, ComboBox, LineEdit, ListView, Palette, ProgressIndicator, ScrollView, Slider, Spinner, Switch } from "std-widgets.slint";
+import { AboutSlint, CheckBox, LineEdit, ListView, Palette, ProgressIndicator, ScrollView, Slider, Spinner, Switch } from "std-widgets.slint";
 
 export global Ui {
     // "Segoe Fluent Icons" on Windows 11, "Segoe MDL2 Assets" on Windows 10 (set from Rust).
@@ -48,6 +48,9 @@ export global Glyph {
     out property <string> open-new: "\u{E8A7}";
     out property <string> preset: "\u{E9E9}";
     out property <string> target: "\u{ED5E}";
+    out property <string> tag: "\u{E8EC}";
+    out property <string> tip: "\u{E82F}";
+    out property <string> warning: "\u{E7BA}";
 }
 
 // One image in the list. tone: 0 normal, 1 success, 2 caution, 3 critical.
@@ -165,8 +168,11 @@ component SettingCard inherits Rectangle {
     in property <bool> switchable: true;
     // Left inset of the card contents (level with the icon tile by default).
     in property <length> indent: 12px;
+    // A link after the description ("How it works"), when set.
+    in property <string> more;
     in-out property <bool> on: true;
     callback toggled;
+    callback more-clicked;
 
     private property <bool> open: !root.switchable || root.on;
 
@@ -204,11 +210,38 @@ component SettingCard inherits Rectangle {
                     color: Palette.foreground;
                     overflow: elide;
                 }
-                if root.description != "": Text {
-                    text: root.description;
-                    font-size: 12px;
-                    color: Ui.secondary;
-                    overflow: elide;
+                if root.description != "": HorizontalLayout {
+                    Text {
+                        text: root.description;
+                        font-size: 12px;
+                        color: Ui.secondary;
+                        overflow: elide;
+                    }
+                    if root.more != "": Text {
+                        text: " · ";
+                        font-size: 12px;
+                        color: Ui.secondary;
+                    }
+                    if root.more != "": Rectangle {
+                        width: link.preferred-width;
+                        accessible-role: button;
+                        accessible-label: root.more;
+                        accessible-action-default => { root.more-clicked(); }
+                        link := Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: root.more;
+                            font-size: 12px;
+                            color: link-touch.has-hover ? Palette.accent-background.brighter(0.25) : Palette.accent-background;
+                            accessible-role: none;
+                        }
+                        link-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.more-clicked(); }
+                        }
+                    }
+                    // Keeps the description and link together on the left.
+                    Rectangle { horizontal-stretch: 1; }
                 }
             }
             if root.switchable: VerticalLayout {
@@ -322,6 +355,304 @@ component NumberRow {
             input-type: number;
             horizontal-alignment: right;
             edited => { root.edited(); }
+        }
+    }
+}
+
+// A drop-down list of choices that looks and behaves like the style's ComboBox, except that
+// its list is as wide as the longest choice when that is wider than the box (it grows to the
+// left). The style's list is always exactly as wide as its box, which cuts off longer choices
+// and leaves a narrow box ("KB") nothing but "…".
+component DropDown {
+    in property <[string]> model;
+    in property <bool> enabled: true;
+    in-out property <int> current-index: 0;
+    out property <string> current-value: root.current-index >= 0 && root.current-index < root.model.length
+        ? root.model[root.current-index] : "";
+    callback selected(string);
+
+    private property <length> item-height: 40px;
+    private property <length> list-padding: 4px;
+    private property <int> visible-items: min(6, root.model.length);
+    private property <bool> list-open;
+    // Item: 16px padding, the text, 8px spacing, the 16px check mark, 16px padding.
+    private property <length> list-width: max(root.width, measure.preferred-width + 56px + 2 * root.list-padding + 2px);
+    private property <brush> hover: #63636333;
+    private property <brush> pressed-bg: Ui.dark ? #16161680 : #BEBEBE80;
+    private property <brush> selected-bg: Ui.dark ? #4D4D4D4D : #98989833;
+
+    min-width: max(160px, box-layout.min-width);
+    min-height: max(32px, box-layout.min-height);
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    opacity: root.enabled ? 1 : 0.5;
+    forward-focus: focus;
+    accessible-role: combobox;
+    accessible-enabled: root.enabled;
+    accessible-expandable: true;
+    accessible-expanded: root.list-open;
+    accessible-value: root.current-value;
+    accessible-action-expand => { root.open(); }
+
+    function choose(index: int) {
+        if (!root.enabled || index < 0 || index >= root.model.length) {
+            return;
+        }
+        root.current-index = index;
+        root.selected(root.current-value);
+    }
+
+    function open() {
+        if (root.enabled) {
+            list.show();
+        }
+    }
+
+    // The longest choice, measured (never drawn).
+    measure := VerticalLayout {
+        width: 0;
+        height: 0;
+        visible: false;
+        for value in root.model: Text { text: value; }
+    }
+
+    box := Rectangle {
+        border-radius: 16px;
+        background: Palette.control-background;
+        border-width: 1px;
+        border-color: Palette.border;
+
+        box-layout := HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 10px;
+            Text {
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                color: Palette.control-foreground;
+                text: root.current-value;
+                overflow: elide;
+                accessible-role: none;
+            }
+            Path {
+                width: 16px;
+                height: 16px;
+                cross-axis-self-alignment: center;
+                viewbox-width: 16;
+                viewbox-height: 16;
+                commands: "M13 6L8 11L3 6H13Z";
+                fill: Palette.control-foreground;
+                accessible-role: none;
+            }
+        }
+
+        Rectangle {
+            border-radius: box.border-radius;
+            background: touch.pressed ? root.pressed-bg : touch.has-hover ? root.hover : transparent;
+        }
+        if (focus.has-focus || root.list-open) && root.enabled: Rectangle {
+            width: box.width + 6px;
+            height: box.height + 6px;
+            border-width: 1px;
+            border-radius: box.border-radius + 3px;
+            border-color: Palette.accent-background;
+        }
+    }
+
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.UpArrow) {
+                root.choose(max(root.current-index - 1, 0));
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.choose(min(root.current-index + 1, root.model.length - 1));
+                return accept;
+            }
+            if (event.text == Key.Return || event.text == " ") {
+                root.open();
+                return accept;
+            }
+            reject
+        }
+
+        touch := TouchArea {
+            enabled: root.enabled;
+            clicked => {
+                focus.focus();
+                root.open();
+            }
+        }
+    }
+
+    list := PopupWindow {
+        x: root.width - root.list-width;
+        y: root.height + 4px;
+        width: root.list-width;
+        height: root.visible-items * root.item-height + 2 * root.list-padding;
+        close-policy: close-on-click-outside;
+        forward-focus: list-focus;
+
+        list-focus := FocusScope {
+            focus-changed-event => {
+                root.list-open = self.has-focus;
+            }
+            key-pressed(event) => {
+                if (event.text == Key.UpArrow) {
+                    root.choose(max(root.current-index - 1, 0));
+                    return accept;
+                }
+                if (event.text == Key.DownArrow) {
+                    root.choose(min(root.current-index + 1, root.model.length - 1));
+                    return accept;
+                }
+                if (event.text == Key.Return || event.text == Key.Escape) {
+                    list.close();
+                    return accept;
+                }
+                reject
+            }
+
+            Rectangle {
+                border-radius: 8px;
+                background: Palette.alternate-background;
+                drop-shadow-blur: 16px;
+                drop-shadow-offset-y: 4px;
+                drop-shadow-color: Ui.dark ? #00000052 : #00000014;
+
+                Rectangle {
+                    border-width: 1px;
+                    border-radius: parent.border-radius;
+                    border-color: Ui.dark ? #DEDEDE33 : #3D3D3D33;
+                }
+
+                ScrollView {
+                    // Scrolled so the chosen item shows.
+                    content-y: -max(0, root.current-index - root.visible-items + 1) * root.item-height;
+                    VerticalLayout {
+                        alignment: start;
+                        padding: root.list-padding;
+                        for value[index] in root.model: entry := Rectangle {
+                            property <bool> chosen: index == root.current-index;
+                            height: root.item-height;
+                            accessible-role: list-item;
+                            accessible-label: value;
+                            accessible-item-selectable: true;
+                            accessible-item-selected: self.chosen;
+                            accessible-item-index: index;
+
+                            // Like the style's list items: a 32px pill with 8px below it.
+                            Rectangle {
+                                y: 0;
+                                height: parent.height - 8px;
+                                border-radius: 16px;
+                                background: item-touch.pressed ? root.pressed-bg
+                                    : item-touch.has-hover ? root.hover
+                                    : entry.chosen ? root.selected-bg : transparent;
+                                HorizontalLayout {
+                                    padding-left: 16px;
+                                    padding-right: 16px;
+                                    spacing: 8px;
+                                    item-text := Text {
+                                        text: value;
+                                        color: entry.chosen ? Palette.accent-background : Palette.control-foreground;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        accessible-role: none;
+                                    }
+                                    Path {
+                                        width: 16px;
+                                        height: 16px;
+                                        cross-axis-self-alignment: center;
+                                        viewbox-width: 16;
+                                        viewbox-height: 16;
+                                        commands: "M12.8406 3.008C12.6197 3.05641 12.4215 3.17755 12.2776 3.352L5.99762 10.539L3.74762 8.28901C3.37062 7.91301 2.68561 7.91301 2.30961 8.28901C1.93261 8.66601 1.93261 9.35 2.30961 9.727L5.30961 12.727L6.09061 13.477L6.77863 12.664L13.7786 4.664C14.3456 4.047 13.6626 2.84 12.8406 3.008Z";
+                                        fill: item-text.color;
+                                        visible: entry.chosen;
+                                        accessible-role: none;
+                                    }
+                                }
+                            }
+                            item-touch := TouchArea {
+                                clicked => {
+                                    root.choose(index);
+                                    list.close();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Help text for a setting: the text on a soft panel, after a lightbulb in an accent chip
+// (like the cards' icon tiles). A warning only swaps the lightbulb for a warning sign: it's
+// there to be read, not to alarm.
+component Hint inherits Rectangle {
+    in property <string> text;
+    in property <bool> warning;
+
+    border-radius: 8px;
+    background: Palette.foreground.with-alpha(0.05);
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+
+    HorizontalLayout {
+        padding: 8px;
+        padding-right: 10px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: start;
+            Rectangle {
+                width: 22px;
+                height: 22px;
+                border-radius: 6px;
+                background: Ui.tint;
+                Icon {
+                    glyph: root.warning ? Glyph.warning : Glyph.tip;
+                    color: Palette.accent-background;
+                    font-size: 12px;
+                }
+            }
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.text;
+            font-size: 12px;
+            color: Ui.secondary;
+            wrap: word-wrap;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+}
+
+// A label and a drop-down list of choices.
+component ChoiceRow {
+    in property <string> label;
+    in property <[string]> model;
+    in property <bool> enabled: true;
+    in-out property <int> current-index;
+    callback selected;
+
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            width: 96px;
+            text: root.label;
+            vertical-alignment: center;
+            color: root.enabled ? Palette.foreground : Ui.tertiary;
+        }
+        DropDown {
+            horizontal-stretch: 1;
+            model: root.model;
+            current-index <=> root.current-index;
+            enabled: root.enabled;
+            accessible-label: root.label;
+            selected => { root.selected(); }
         }
     }
 }
@@ -966,6 +1297,148 @@ struct LicenseEntry {
     detail: string,
 }
 
+// One part of a "How it works" dialog. Lines of `body` starting with "• " read as a list.
+struct InfoSection {
+    heading: string,
+    body: string,
+}
+
+// A settings card's "How it works": its icon and title, then short sections, on a card
+// centered over the dimmed window. Got it, ✕, Esc or a click outside closes it; the sections
+// scroll when the window is too short for them.
+component InfoDialog inherits Rectangle {
+    in property <string> glyph;
+    in property <string> title;
+    in property <[InfoSection]> sections;
+    callback close;
+
+    // Everything but the sections: title bar, its divider and the footer.
+    private property <length> chrome: 57px + footer.preferred-height;
+
+    background: #00000080;
+    accessible-role: groupbox;
+    accessible-label: root.title;
+
+    // Clicks outside the card close it; nothing reaches the window below.
+    TouchArea {
+        clicked => { root.close(); }
+        scroll-event(e) => { accept }
+    }
+    keys := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.close();
+                return accept;
+            }
+            reject
+        }
+    }
+    init => { keys.focus(); }
+
+    card := Rectangle {
+        width: min(520px, root.width - 32px);
+        height: min(root.chrome + body.preferred-height, root.height - 32px);
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        background: Ui.card;
+        border-radius: 16px;
+        border-width: 1px;
+        border-color: Ui.card-border;
+        clip: true;
+
+        // Clicks on the card itself don't close it.
+        TouchArea { }
+
+        VerticalLayout {
+            // ---- title bar
+            Rectangle {
+                height: 56px;
+                background: Palette.control-background;
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 12px;
+                    spacing: 12px;
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 32px;
+                            height: 32px;
+                            border-radius: 8px;
+                            background: Ui.tint;
+                            Icon {
+                                glyph: root.glyph;
+                                color: Palette.accent-background;
+                                font-size: 16px;
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.title;
+                        font-size: 16px;
+                        font-weight: 600;
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        GlyphButton {
+                            glyph: Glyph.cancel;
+                            accessible-label: "Close";
+                            clicked => { root.close(); }
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                height: 1px;
+                background: Ui.card-border;
+            }
+
+            // ---- the sections
+            ScrollView {
+                vertical-stretch: 1;
+                body := VerticalLayout {
+                    alignment: start;
+                    padding-left: 22px;
+                    padding-right: 22px;
+                    padding-top: 18px;
+                    padding-bottom: 6px;
+                    spacing: 16px;
+                    for section in root.sections: VerticalLayout {
+                        spacing: 4px;
+                        Text {
+                            text: section.heading;
+                            font-size: 13px;
+                            font-weight: 600;
+                            color: Palette.foreground;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: section.body;
+                            font-size: 13px;
+                            color: Ui.secondary;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+
+            // ---- footer
+            footer := HorizontalLayout {
+                alignment: end;
+                padding: 16px;
+                padding-top: 10px;
+                GlyphButton {
+                    text: "Got it";
+                    primary: true;
+                    clicked => { root.close(); }
+                }
+            }
+        }
+    }
+}
+
 // The About dialog: a card centered over the dimmed window, with a Licenses view. Clicking
 // outside it or pressing Esc closes it (Esc on the Licenses view goes back first).
 component AboutDialog inherits Rectangle {
@@ -982,9 +1455,10 @@ component AboutDialog inherits Rectangle {
         { name: "mozjpeg", detail: "JPEG encoder · IJG, BSD-3-Clause and zlib licenses" },
         { name: "libwebp", detail: "WebP encoder · BSD-3-Clause" },
         { name: "rav1e, ravif", detail: "AVIF encoder · BSD-2-Clause, BSD-3-Clause" },
-        { name: "rav1d, avif-decode", detail: "AVIF decoder for previews · BSD-2-Clause, BSD-3-Clause; avif-parse · MPL-2.0" },
+        { name: "rav1d, avif-decode", detail: "AVIF decoder · BSD-2-Clause, BSD-3-Clause; avif-parse · MPL-2.0" },
         { name: "oxipng", detail: "PNG optimizer · MIT" },
         { name: "image", detail: "Image decoding · MIT or Apache-2.0" },
+        { name: "moxcms", detail: "Color management · BSD-3-Clause or Apache-2.0" },
         { name: "Rust crates", detail: "rayon, rfd, serde, walkdir and others · MIT, Apache-2.0 or similar permissive licenses" },
     ];
 
@@ -1206,7 +1680,7 @@ component AboutDialog inherits Rectangle {
                     spacing: 12px;
                     Text {
                         text: entry.name;
-                        width: 110px;
+                        width: 128px;
                         font-weight: 600;
                         color: Palette.foreground;
                     }
@@ -1364,6 +1838,57 @@ export component AppWindow inherits Window {
     in-out property <bool> target-size;
     in-out property <string> target-value: "200";
     in-out property <int> target-unit;
+    // Color profile: 0 keep, 1 convert to sRGB. Metadata: 0 remove all, 1 keep except the
+    // location, 2 keep all.
+    in-out property <int> color-profile;
+    in-out property <int> metadata-mode;
+    // The "How it works" dialog showing: 0 none, 1 target file size, 2 color profile and
+    // metadata.
+    in-out property <int> info-topic;
+    property <[InfoSection]> target-info: [
+        {
+            heading: "What it does",
+            body: "Each JPEG, WebP and AVIF file is made as good as it can be while staying under the size you set. The quality is picked for every image on its own, so the quality sliders are set aside while this is on.",
+        },
+        {
+            heading: "How the quality is picked",
+            body: "It tries 100% first. If that's too big, it narrows down to the highest quality that fits, to within 2 points, going no lower than 10%. Tiles and the preview show the quality picked, like \"WebP at 71%\".",
+        },
+        {
+            heading: "With other settings",
+            body: "• With Skip files larger than the original on, it also stays smaller than the original, so nothing gets thrown away.\n• Kept metadata counts toward the size.\n• PNG and lossless WebP aren't changed: they have no quality to lower.",
+        },
+        {
+            heading: "When it can't fit",
+            body: "If even 10% is too big, the image is still saved, at its smallest, and marked in amber. Clear images from the list once optimized leaves it in the list so you can look at it.",
+        },
+    ];
+    property <[InfoSection]> color-info: [
+        {
+            heading: "Color profiles",
+            body: "A color profile says which colors an image's numbers stand for. Most images are sRGB, the web's default. Photos from recent phones and cameras are often Display P3 or Adobe RGB, which reach more saturated colors. Thumbnails and the preview show colors correctly either way.",
+        },
+        {
+            heading: "Keep",
+            body: "Wide-gamut photos keep their profile, so they look like the original. JPEG, WebP and PNG carry it in the file. An sRGB profile is left out, since sRGB is the default anyway. AVIF files can't carry one here, so they're converted to sRGB.",
+        },
+        {
+            heading: "Convert to sRGB",
+            body: "The colors are converted to sRGB and no profile is saved: the same colors in every app, and slightly smaller files. Colors outside sRGB are pulled in, so wide-gamut photos lose a little saturation.",
+        },
+        {
+            heading: "Metadata",
+            body: "• Remove all: nothing about the camera, author, date or location is kept. The smallest files.\n• Keep, except location: camera, lens, exposure settings, date taken, author, copyright and description.\n• Keep all: all of that and the location (GPS), so anyone with the file can see where it was taken.",
+        },
+        {
+            heading: "Always left out",
+            body: "Maker notes (the camera maker's private data, often tens of KB), the embedded thumbnail, and XMP and IPTC data. The profile and metadata of AVIF originals aren't read.",
+        },
+        {
+            heading: "Orientation",
+            body: "Photos come out upright: the camera's orientation is applied to the pixels, so it isn't saved in the file.",
+        },
+    ];
     // How far the settings pane is scrolled (negative, as Slint keeps it).
     in-out property <length> settings-scroll;
 
@@ -1521,7 +2046,7 @@ export component AppWindow inherits Window {
                                 }
                                 VerticalLayout {
                                     alignment: center;
-                                    ComboBox {
+                                    DropDown {
                                         model: root.preset-names;
                                         current-index <=> root.preset-index;
                                         enabled: root.idle;
@@ -1654,7 +2179,7 @@ export component AppWindow inherits Window {
                         enabled: root.idle;
                         on <=> root.resize;
                         toggled => { root.settings-changed(); }
-                        ComboBox {
+                        DropDown {
                             model: root.resize-options;
                             current-index <=> root.resize-mode;
                             enabled: root.idle;
@@ -1678,17 +2203,16 @@ export component AppWindow inherits Window {
                             enabled: root.idle;
                             edited => { root.settings-changed(); }
                         }
-                        if root.resize-hint != "": Text {
+                        if root.resize-hint != "": Hint {
                             text: root.resize-hint;
-                            color: Ui.secondary;
-                            font-size: 12px;
-                            wrap: word-wrap;
                         }
                     }
                     SettingCard {
                         glyph: Glyph.target;
                         title: "Target file size";
-                        description: "Lowers quality until files fit";
+                        description: "Caps file sizes";
+                        more: "How it works";
+                        more-clicked => { root.info-topic = 1; }
                         enabled: root.idle;
                         on <=> root.target-size;
                         toggled => { root.settings-changed(); }
@@ -1707,19 +2231,13 @@ export component AppWindow inherits Window {
                                 horizontal-alignment: right;
                                 edited => { root.settings-changed(); }
                             }
-                            ComboBox {
+                            DropDown {
                                 width: 78px;
                                 model: ["KB", "MB"];
                                 current-index <=> root.target-unit;
                                 enabled: root.idle;
                                 selected => { root.settings-changed(); }
                             }
-                        }
-                        Text {
-                            text: "For JPEG, WebP and AVIF, picks the highest quality (up to 100%) that fits, so their quality sliders are set aside; with Skip files larger than the original on, it also stays smaller than the original. PNG and lossless WebP aren't changed.";
-                            color: Ui.secondary;
-                            font-size: 12px;
-                            wrap: word-wrap;
                         }
                     }
 
@@ -1729,7 +2247,7 @@ export component AppWindow inherits Window {
                         glyph: Glyph.save;
                         title: "Output folder";
                         switchable: false;
-                        ComboBox {
+                        DropDown {
                             model: ["\"optimized\" folder next to images", "Custom folder"];
                             current-index <=> root.save-mode;
                             enabled: root.idle;
@@ -1775,11 +2293,34 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    Text {
-                        text: "Metadata (EXIF, GPS) is removed and photo orientation is applied.";
-                        wrap: word-wrap;
-                        font-size: 12px;
-                        color: Ui.tertiary;
+                    Rectangle { height: 4px; }
+                    SectionHeading { text: "Advanced settings"; }
+                    SettingCard {
+                        glyph: Glyph.tag;
+                        title: "Color profile and metadata";
+                        description: "Profiles, EXIF and location";
+                        more: "How it works";
+                        more-clicked => { root.info-topic = 2; }
+                        switchable: false;
+                        ChoiceRow {
+                            label: "Color profile";
+                            model: ["Keep", "Convert to sRGB"];
+                            current-index <=> root.color-profile;
+                            enabled: root.idle;
+                            selected => { root.settings-changed(); }
+                        }
+                        ChoiceRow {
+                            label: "Metadata";
+                            model: ["Remove all", "Keep, except location", "Keep all"];
+                            current-index <=> root.metadata-mode;
+                            enabled: root.idle;
+                            selected => { root.settings-changed(); }
+                        }
+                        // Kept location is a privacy matter: said right here, not behind a link.
+                        if root.metadata-mode == 2: Hint {
+                            text: "The location (GPS) is kept: anyone with the file can see it.";
+                            warning: true;
+                        }
                     }
                 }
             }
@@ -1953,6 +2494,17 @@ export component AppWindow inherits Window {
         open-website => { root.open-website(); }
         open-source => { root.open-source(); }
         close => { root.about-open = false; }
+    }
+
+    if root.info-topic != 0: InfoDialog {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        glyph: root.info-topic == 1 ? Glyph.target : Glyph.tag;
+        title: root.info-topic == 1 ? "Target file size" : "Color profile and metadata";
+        sections: root.info-topic == 1 ? root.target-info : root.color-info;
+        close => { root.info-topic = 0; }
     }
 
     if root.preset-dialog-open: PresetDialog {

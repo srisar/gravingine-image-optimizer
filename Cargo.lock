@@ -1868,9 +1868,11 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "avif-decode",
+ "crc32fast",
  "embed-resource",
  "image",
  "imgref",
+ "moxcms",
  "mozjpeg",
  "oxipng",
  "ravif",
