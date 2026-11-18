@@ -17,9 +17,10 @@ smaller files.
   | AVIF | ravif / rav1e | Smallest files, slower to encode |
   | PNG  | oxipng (lossless) | Re-compresses PNGs in place when not resized |
 - **Resize** with presets: Thumbnails (230 × 230), Small (640 × 480), Medium (800 × 600), Large (1024 × 768), HD (1920 × 1080) and 4K (3840 × 2160), which fit the image within the size turned to its orientation (a portrait photo fits 480 × 640 for Small); or reduce to 25%, 50% or 75%; or a custom maximum width/height or percentage. The aspect ratio is kept and images are never enlarged.
+- **Target file size** (e.g. "keep each file under 200 KB"): for JPEG, lossy WebP and AVIF, a binary search over quality picks the highest quality that fits (within 2 points, from 100% down to 10%; the quality sliders are set aside while a target is on). With *Skip files larger than the original* on, it also stays smaller than the original, so the output isn't thrown away. Tiles and the preview show the quality picked ("WebP 196.8 KB at 71%"); an image that doesn't fit even at 10% is still saved, at its smallest, and flagged in amber. PNG and lossless WebP aren't changed. Presets can include a target.
 - Strips metadata (EXIF/GPS) and bakes in EXIF orientation.
 - *Skip outputs larger than the original* so you never end up with a worse file.
-- *Clear images from the list once optimized* (under *Save to*): after a run, images that optimized cleanly leave the list and their savings go into the status line; images with errors stay, so you can read why.
+- *Clear images from the list once optimized* (under *Save to*): after a run, images that optimized cleanly leave the list and their savings go into the status line; images with errors or a missed target size stay, so you can look at them.
 - File list as tiles: thumbnail with a status badge, file name and format, what will be produced (or the colored result) and where it was saved, with a progress bar while optimizing. On the right, *Original* and *Output* columns: dimensions and file size before, and the resized dimensions and smallest saved size after. Tick the images to process with their checkboxes; *Select all* / *Select none*.
 - **Before / after preview**: adding a single image opens it straight away; otherwise clicking a tile (or its eye button) opens the original and an output side by side with a split line you drag across, both drawn at the same size so quality is what you compare. Before optimizing, it's a live preview: the current settings are encoded in memory (nothing is saved), and moving a slider or switching a format re-encodes it, so you can tune by eye and then click *Optimize*. Optimized images can switch between *Saved* (the files written) and *Preview*. Choose the format and the zoom (*Fit*, 25%, 50%, 75% or 100%; drag to pan when the picture is bigger than the view); Esc closes it. Every format can be previewed, AVIF included (decoded with [avif-decode](https://github.com/kornelski/avif-decode), pure Rust on the rav1d AV1 decoder).
 - Parallel processing on all CPU cores, cancellable, with per-file and total savings, progress on the taskbar button, and a taskbar flash when a run finishes in the background.
@@ -31,7 +32,7 @@ smaller files.
   - the file list highlights while files are dragged over the window;
   - scales per monitor; icons are glyphs from the Windows icon font (Segoe Fluent Icons, or Segoe MDL2 Assets on Windows 10). The window and taskbar icon is the Gravingine logo, drawn at runtime.
 
-Inputs: jpg, jpeg, jfif, png, webp, gif, bmp, tif, tiff, ico.
+Inputs: jpg, jpeg, jfif, png, webp, avif, gif, bmp, tif, tiff, ico.
 
 ## Output location
 
@@ -124,11 +125,15 @@ GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_CLEAR=1 cargo run -- "D:
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_PRESET=0 cargo run -- "D:\Photos"   # apply the first preset (Web)
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_PRESET_DIALOG=1 cargo run   # the "Save as preset" dialog
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_SAVE_PRESET="My blog" cargo run   # save the settings as a preset (not written to disk)
+GIO_SNAPSHOT=window.png GIO_SNAPSHOT_TARGET=200 GIO_SNAPSHOT_RUN=1 cargo run -- "D:\Photos"   # target file size on, at 200 KB
+GIO_SNAPSHOT=window.png GIO_SNAPSHOT_SCROLL=820 cargo run   # scroll the settings pane down 820 px
+# Snapshot runs leave "Clear images ... once optimized" off unless GIO_SNAPSHOT_CLEAR=1.
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_COMPARE=0 cargo run -- "D:\Photos"   # run, then open the comparison for the first image
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_RUN=1 GIO_SNAPSHOT_COMPARE=0 GIO_SNAPSHOT_ZOOM=100 GIO_SNAPSHOT_SPLIT=0.3 cargo run -- "D:\Photos"   # ...at 100% (or 25, 50, 75), line at 30%
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_ALL_ON=1 GIO_SNAPSHOT_COMPARE=0 GIO_SNAPSHOT_COMPARE_FORMAT=2 cargo run -- "D:\Photos"   # live preview of the AVIF (3rd format chip)
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_COMPARE=0 cargo run -- "D:\Photos"   # live preview of the first image, nothing optimized
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_COMPARE=0 GIO_SNAPSHOT_RETUNE=20 cargo run -- "D:\Photos"   # ...then set WebP/JPEG quality to 20 while it's open
+GIO_SNAPSHOT=window.png GIO_SNAPSHOT_COMPARE=0 GIO_SNAPSHOT_RETUNE=20 GIO_SNAPSHOT_WAIT=2000 cargo run -- "D:\Photos"   # ...capture after 2 s, while the preview is updating
 GIO_THEME=dark cargo run   # force dark (or light) instead of following Windows
 GIO_SNAPSHOT=window.png GIO_SNAPSHOT_ABOUT=1 cargo run   # the About dialog (GIO_SNAPSHOT_ABOUT=licenses: its Licenses view)
 cargo build --release --features snapshot   # the same self-snapshots in an optimized build

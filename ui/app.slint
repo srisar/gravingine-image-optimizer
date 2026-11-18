@@ -2,7 +2,7 @@
 // Colors come from the style's Palette (which follows Windows' light/dark mode and tints its
 // accent from the Windows accent color); icons are glyphs from the Windows icon font.
 
-import { AboutSlint, CheckBox, ComboBox, LineEdit, ListView, Palette, ProgressIndicator, ScrollView, Slider, Switch } from "std-widgets.slint";
+import { AboutSlint, CheckBox, ComboBox, LineEdit, ListView, Palette, ProgressIndicator, ScrollView, Slider, Spinner, Switch } from "std-widgets.slint";
 
 export global Ui {
     // "Segoe Fluent Icons" on Windows 11, "Segoe MDL2 Assets" on Windows 10 (set from Rust).
@@ -47,6 +47,7 @@ export global Glyph {
     out property <string> info: "\u{E946}";
     out property <string> open-new: "\u{E8A7}";
     out property <string> preset: "\u{E9E9}";
+    out property <string> target: "\u{ED5E}";
 }
 
 // One image in the list. tone: 0 normal, 1 success, 2 caution, 3 critical.
@@ -793,7 +794,8 @@ component CompareView inherits Rectangle {
                 text: root.output-label;
             }
 
-            if root.message != "": Rectangle {
+            // A message from the last result gives way while the next one is being made.
+            if root.message != "" && root.busy == "": Rectangle {
                 width: msg.preferred-width + 28px;
                 height: 34px;
                 border-radius: 17px;
@@ -803,19 +805,38 @@ component CompareView inherits Rectangle {
                     color: Ui.secondary;
                 }
             }
-            // "Loading…" / "Updating preview…": at the bottom, so the picture stays visible.
+            // "Loading…" / "Updating preview…": centered on the picture, with a spinner and a
+            // shadow so it reads over any image.
             if root.busy != "": Rectangle {
-                y: stage.height - self.height - 12px;
-                width: busy-text.preferred-width + 28px;
-                height: 28px;
-                border-radius: 14px;
+                width: busy-row.preferred-width;
+                height: 52px;
+                border-radius: 26px;
                 background: Ui.card;
                 border-width: 1px;
                 border-color: Ui.card-border;
-                busy-text := Text {
-                    text: root.busy;
-                    font-size: 12px;
-                    color: Ui.secondary;
+                drop-shadow-blur: 18px;
+                drop-shadow-offset-y: 4px;
+                drop-shadow-color: #00000059;
+                busy-row := HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 22px;
+                    spacing: 12px;
+                    alignment: center;
+                    VerticalLayout {
+                        alignment: center;
+                        Spinner {
+                            indeterminate: true;
+                            width: 26px;
+                            height: 26px;
+                        }
+                    }
+                    Text {
+                        text: root.busy;
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                    }
                 }
             }
         }
@@ -1339,6 +1360,12 @@ export component AppWindow inherits Window {
     in-out property <bool> skip-larger: true;
     in-out property <bool> overwrite;
     in-out property <bool> clear-when-done;
+    // Target file size: on/off, the value and its unit (0 KB, 1 MB).
+    in-out property <bool> target-size;
+    in-out property <string> target-value: "200";
+    in-out property <int> target-unit;
+    // How far the settings pane is scrolled (negative, as Slint keeps it).
+    in-out property <length> settings-scroll;
 
     // ---- state (written by Rust)
     in property <[TileData]> tiles;
@@ -1457,6 +1484,7 @@ export component AppWindow inherits Window {
 
             ScrollView {
                 vertical-stretch: 1;
+                content-y <=> root.settings-scroll;
                 VerticalLayout {
                     // Stack from the top: extra height stays empty instead of stretching the cards.
                     alignment: start;
@@ -1548,7 +1576,7 @@ export component AppWindow inherits Window {
                             minimum: 1;
                             maximum: 100;
                             value <=> root.webp-quality;
-                            enabled: root.idle && !root.webp-lossless;
+                            enabled: root.idle && !root.webp-lossless && !root.target-size;
                             changed => { root.settings-changed(); }
                         }
                         SwitchRow {
@@ -1571,7 +1599,7 @@ export component AppWindow inherits Window {
                             minimum: 1;
                             maximum: 100;
                             value <=> root.avif-quality;
-                            enabled: root.idle;
+                            enabled: root.idle && !root.target-size;
                             changed => { root.settings-changed(); }
                         }
                         SliderRow {
@@ -1596,7 +1624,7 @@ export component AppWindow inherits Window {
                             minimum: 1;
                             maximum: 100;
                             value <=> root.jpeg-quality;
-                            enabled: root.idle;
+                            enabled: root.idle && !root.target-size;
                             changed => { root.settings-changed(); }
                         }
                     }
@@ -1652,6 +1680,43 @@ export component AppWindow inherits Window {
                         }
                         if root.resize-hint != "": Text {
                             text: root.resize-hint;
+                            color: Ui.secondary;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                    SettingCard {
+                        glyph: Glyph.target;
+                        title: "Target file size";
+                        description: "Lowers quality until files fit";
+                        enabled: root.idle;
+                        on <=> root.target-size;
+                        toggled => { root.settings-changed(); }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "Keep each file under";
+                                vertical-alignment: center;
+                                color: root.idle ? Palette.foreground : Ui.tertiary;
+                            }
+                            LineEdit {
+                                width: 76px;
+                                text <=> root.target-value;
+                                enabled: root.idle;
+                                input-type: number;
+                                horizontal-alignment: right;
+                                edited => { root.settings-changed(); }
+                            }
+                            ComboBox {
+                                width: 78px;
+                                model: ["KB", "MB"];
+                                current-index <=> root.target-unit;
+                                enabled: root.idle;
+                                selected => { root.settings-changed(); }
+                            }
+                        }
+                        Text {
+                            text: "For JPEG, WebP and AVIF, picks the highest quality (up to 100%) that fits, so their quality sliders are set aside; with Skip files larger than the original on, it also stays smaller than the original. PNG and lossless WebP aren't changed.";
                             color: Ui.secondary;
                             font-size: 12px;
                             wrap: word-wrap;
@@ -1791,7 +1856,7 @@ export component AppWindow inherits Window {
                         color: Ui.secondary;
                     }
                     Text {
-                        text: "JPG · PNG · WebP · GIF · BMP · TIFF · ICO";
+                        text: "JPG · PNG · WebP · AVIF · GIF · BMP · TIFF · ICO";
                         horizontal-alignment: center;
                         font-size: 12px;
                         color: Ui.tertiary;
