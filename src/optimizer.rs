@@ -1,12 +1,15 @@
 //! Image decoding, resizing and encoding to web formats.
 
+use std::borrow::Cow;
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use image::{DynamicImage, ImageDecoder, ImageReader, imageops::FilterType};
+use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageReader, imageops::FilterType};
 use serde::{Deserialize, Serialize};
+
+use crate::metadata;
 
 /// Output formats the optimizer can produce.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -64,6 +67,28 @@ pub enum ResizeMode {
     Box,
 }
 
+/// What happens to a color profile other than sRGB.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorProfile {
+    /// Embed it in the output (AVIF, whose encoder can't, is converted to sRGB instead).
+    #[default]
+    Keep,
+    /// Convert the pixels to sRGB and embed no profile.
+    Srgb,
+}
+
+/// Which EXIF metadata outputs keep. Maker notes, the embedded thumbnail and the orientation
+/// (applied to the pixels) never come along; XMP and IPTC aren't kept either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Metadata {
+    #[default]
+    Remove,
+    /// Camera, lens, exposure, dates, author, copyright: everything but the location.
+    KeepExceptLocation,
+    /// The above and the location (GPS).
+    KeepAll,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -98,6 +123,9 @@ pub struct Settings {
     /// The size limit, in KB (1024 bytes).
     pub target_kb: u32,
 
+    pub color_profile: ColorProfile,
+    pub metadata: Metadata,
+
     pub output: OutputLocation,
     /// Don't write an output that is not smaller than the original file.
     pub skip_if_larger: bool,
@@ -128,6 +156,8 @@ impl Default for Settings {
             box_height: 1080,
             target_size: false,
             target_kb: 200,
+            color_profile: ColorProfile::Keep,
+            metadata: Metadata::Remove,
             output: OutputLocation::Subfolder,
             skip_if_larger: true,
             overwrite: true,
@@ -264,13 +294,33 @@ pub fn target_size(w: u32, h: u32, settings: &Settings) -> Option<(u32, u32)> {
 pub struct Decoded {
     bytes: Vec<u8>,
     image: DynamicImage,
+    /// The image's color profile, when it's an RGB profile other than sRGB.
+    icc: Option<Vec<u8>>,
+    /// The image's EXIF block, as the file has it.
+    exif: Option<Vec<u8>>,
+}
+
+/// What goes into an output file besides the pixels.
+#[derive(Clone, Copy, Default)]
+struct Extras<'a> {
+    icc: Option<&'a [u8]>,
+    exif: Option<&'a [u8]>,
+}
+
+/// The pixels to encode for one format, with what goes into the file with them.
+struct Prepared<'a> {
+    image: Cow<'a, DynamicImage>,
+    extras: Extras<'a>,
+    /// The pixels are the original file's (not resized or converted), so a PNG can be
+    /// re-compressed as it is.
+    original_pixels: bool,
 }
 
 impl Decoded {
     pub fn open(path: &Path) -> Result<Self> {
         let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let image = decode(&bytes)?;
-        Ok(Decoded { bytes, image })
+        let Picture { image, icc, exif } = decode(&bytes)?;
+        Ok(Decoded { bytes, image, icc, exif })
     }
 
     /// Size of the original file in bytes.
@@ -278,30 +328,61 @@ impl Decoded {
         self.bytes.len() as u64
     }
 
-    /// The upright original pixels.
+    /// The upright original pixels, in sRGB for the screen.
     pub fn rgba(&self) -> image::RgbaImage {
-        self.image.to_rgba8()
+        metadata::display_rgba(&self.image, self.icc.as_deref())
     }
 
     /// The image at the size `settings` ask for, and whether that is a resize.
-    fn resized(&self, settings: &Settings) -> (std::borrow::Cow<'_, DynamicImage>, bool) {
+    fn resized(&self, settings: &Settings) -> (Cow<'_, DynamicImage>, bool) {
         match target_size(self.image.width(), self.image.height(), settings) {
-            Some((w, h)) => (std::borrow::Cow::Owned(self.image.resize_exact(w, h, FilterType::Lanczos3)), true),
-            None => (std::borrow::Cow::Borrowed(&self.image), false),
+            Some((w, h)) => (Cow::Owned(self.image.resize_exact(w, h, FilterType::Lanczos3)), true),
+            None => (Cow::Borrowed(&self.image), false),
         }
     }
 
-    /// Encode `img` (this image, possibly resized) as `format`, in memory.
-    fn encode(&self, img: &DynamicImage, resized: bool, format: Format, settings: &Settings) -> Result<Vec<u8>> {
+    /// The EXIF block outputs of `img` (this image, possibly resized) get, if any.
+    fn output_exif(&self, img: &DynamicImage, settings: &Settings) -> Option<Vec<u8>> {
+        let keep_location = match settings.metadata {
+            Metadata::Remove => return None,
+            Metadata::KeepExceptLocation => false,
+            Metadata::KeepAll => true,
+        };
+        metadata::clean_exif(self.exif.as_deref()?, keep_location, img.width(), img.height())
+    }
+
+    /// `img` (this image, possibly resized) ready to encode as `format`: in sRGB when the
+    /// profile isn't kept (or can't be, in AVIF), with the profile and `exif` to embed.
+    fn prepare<'a>(
+        &'a self,
+        img: &'a DynamicImage,
+        resized: bool,
+        exif: Option<&'a [u8]>,
+        format: Format,
+        settings: &Settings,
+    ) -> Result<Prepared<'a>> {
+        let (image, icc) = match self.icc.as_deref() {
+            Some(icc) if settings.color_profile == ColorProfile::Srgb || format == Format::Avif => {
+                (Cow::Owned(metadata::to_srgb(img, icc)?), None)
+            }
+            icc => (Cow::Borrowed(img), icc),
+        };
+        let original_pixels = !resized && matches!(image, Cow::Borrowed(_));
+        Ok(Prepared { image, extras: Extras { icc, exif }, original_pixels })
+    }
+
+    /// Encode prepared pixels as `format`, in memory.
+    fn encode(&self, p: &Prepared, format: Format, settings: &Settings) -> Result<Vec<u8>> {
+        let (img, extras) = (p.image.as_ref(), p.extras);
         catch_unwind(AssertUnwindSafe(|| match format {
-            Format::Jpeg => encode_jpeg(img, settings.jpeg_quality),
-            Format::WebP => encode_webp(img, settings.webp_quality, settings.webp_lossless),
-            Format::Avif => encode_avif(img, settings.avif_quality, settings.avif_speed),
+            Format::Jpeg => encode_jpeg(img, settings.jpeg_quality, extras),
+            Format::WebP => encode_webp(img, settings.webp_quality, settings.webp_lossless, extras),
+            Format::Avif => encode_avif(img, settings.avif_quality, settings.avif_speed, extras.exif),
             Format::Png => {
                 // Re-compress the original PNG directly when possible: keeps palettes/bit depth.
                 let source_is_png = image::guess_format(&self.bytes).ok() == Some(image::ImageFormat::Png);
-                let input = if source_is_png && !resized { Some(&self.bytes[..]) } else { None };
-                encode_png(img, input, settings.png_level)
+                let input = if source_is_png && p.original_pixels { Some(&self.bytes[..]) } else { None };
+                encode_png(img, input, settings.png_level, extras)
             }
         }))
         .unwrap_or_else(|_| Err(anyhow!("encoder crashed")))
@@ -312,16 +393,16 @@ impl Decoded {
     /// setting) whose output fits, found by a binary search to within 2 points. If even the
     /// lowest quality is too big, that smallest output is returned, marked as over the target.
     /// With "skip files larger than the original" on, it also keeps under the original's size.
-    fn encode_sized(&self, img: &DynamicImage, resized: bool, format: Format, settings: &Settings) -> Result<Encoded> {
+    fn encode_sized(&self, p: &Prepared, format: Format, settings: &Settings) -> Result<Encoded> {
         let top = MAX_TARGET_QUALITY;
         let (Some(target), Some(_)) = (settings.target_bytes(), settings.quality(format)) else {
-            let data = self.encode(img, resized, format, settings)?;
+            let data = self.encode(p, format, settings)?;
             return Ok(Encoded { data, quality: None, over_target: false });
         };
         // With "skip files larger than the original" on, a larger output would be thrown
         // away, so it also has to come out smaller than the original.
         let budget = if settings.skip_if_larger { target.min(self.file_size().saturating_sub(1)) } else { target };
-        let at = |quality: u8| self.encode(img, resized, format, &settings.with_quality(format, quality));
+        let at = |quality: u8| self.encode(p, format, &settings.with_quality(format, quality));
         let fits = |data: &[u8]| data.len() as u64 <= budget;
         let done = |data: Vec<u8>, quality: u8| {
             let over_target = data.len() as u64 > target;
@@ -366,10 +447,13 @@ pub struct Preview {
 /// and decode it back, without saving anything.
 pub fn preview(decoded: &Decoded, format: Format, settings: &Settings) -> Result<Preview> {
     let (img, resized) = decoded.resized(settings);
-    let encoded = decoded.encode_sized(&img, resized, format, settings)?;
+    let exif = decoded.output_exif(&img, settings);
+    let prepared = decoded.prepare(&img, resized, exif.as_deref(), format, settings)?;
+    let encoded = decoded.encode_sized(&prepared, format, settings)?;
+    let output = decode(&encoded.data)?;
     Ok(Preview {
         size: encoded.data.len() as u64,
-        pixels: decode(&encoded.data)?.to_rgba8(),
+        pixels: metadata::display_rgba(&output.image, output.icc.as_deref()),
         quality: encoded.quality,
         over_target: encoded.over_target,
     })
@@ -380,6 +464,7 @@ pub fn process(src: &Source, settings: &Settings) -> Result<Vec<FormatResult>> {
     let decoded = Decoded::open(&src.path)?;
     let original_size = decoded.file_size();
     let (img, resized) = decoded.resized(settings);
+    let exif = decoded.output_exif(&img, settings);
     let out_dir = output_dir(src, settings);
     let stem = src
         .path
@@ -391,7 +476,9 @@ pub fn process(src: &Source, settings: &Settings) -> Result<Vec<FormatResult>> {
         .formats()
         .into_iter()
         .map(|format| {
-            let encoded = decoded.encode_sized(&img, resized, format, settings);
+            let encoded = decoded
+                .prepare(&img, resized, exif.as_deref(), format, settings)
+                .and_then(|prepared| decoded.encode_sized(&prepared, format, settings));
             let quality = encoded.as_ref().ok().and_then(|e| e.quality);
             let target = settings.target_bytes().filter(|_| settings.quality(format).is_some());
             let outcome = match encoded {
@@ -482,34 +569,50 @@ pub fn thumbnail(path: &Path, size: u32) -> Result<Thumbnail> {
         Ok(image::ImageFormat::Avif) => "AVIF",
         _ => "Image",
     };
-    let img = decode(&bytes)?;
-    let (width, height) = (img.width(), img.height());
-    let small = img.resize_to_fill(size, size, FilterType::Triangle).to_rgba8();
+    let Picture { image, icc, .. } = decode(&bytes)?;
+    let (width, height) = (image.width(), image.height());
+    let small = image.resize_to_fill(size, size, FilterType::Triangle);
+    let small = metadata::display_rgba(&small, icc.as_deref());
     Ok(Thumbnail { size: small.width(), rgba: small.into_raw(), width, height, format })
 }
 
-/// Full-size RGBA pixels of an image file, upright (EXIF orientation applied), for previews.
+/// Full-size RGBA pixels of an image file, upright (EXIF orientation applied) and in sRGB,
+/// for previews.
 pub fn load_rgba(path: &Path) -> Result<image::RgbaImage> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(decode(&bytes)?.to_rgba8())
+    let Picture { image, icc, .. } = decode(&bytes)?;
+    Ok(metadata::display_rgba(&image, icc.as_deref()))
 }
 
-fn decode(bytes: &[u8]) -> Result<DynamicImage> {
+/// A decoded image file: its pixels (upright), and the color profile and EXIF it carries.
+struct Picture {
+    image: DynamicImage,
+    /// An RGB profile other than sRGB (see [`metadata::usable_profile`]).
+    icc: Option<Vec<u8>>,
+    exif: Option<Vec<u8>>,
+}
+
+fn decode(bytes: &[u8]) -> Result<Picture> {
     // The image crate has no AVIF decoder here; avif-decode (pure Rust, rav1d) reads AVIF.
+    // (Its color profile and EXIF aren't read.)
     if is_avif(bytes) {
-        return decode_avif(bytes).map(DynamicImage::ImageRgba8);
+        let image = decode_avif(bytes).map(DynamicImage::ImageRgba8)?;
+        return Ok(Picture { image, icc: None, exif: None });
     }
     let mut decoder = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()?
         .into_decoder()
         .context("unsupported or corrupt image")?;
-    // Outputs drop EXIF, so bake the camera orientation into the pixels.
+    // Metadata that can't be read is left out rather than failing the image.
+    let icc = decoder.icc_profile().ok().flatten().and_then(|icc| metadata::usable_profile(&icc));
+    let exif = decoder.exif_metadata().ok().flatten();
+    // Outputs never carry the orientation, so bake it into the pixels.
     let orientation = decoder.orientation().ok();
-    let mut img = DynamicImage::from_decoder(decoder).context("decoding image")?;
+    let mut image = DynamicImage::from_decoder(decoder).context("decoding image")?;
     if let Some(o) = orientation {
-        img.apply_orientation(o);
+        image.apply_orientation(o);
     }
-    Ok(img)
+    Ok(Picture { image, icc, exif })
 }
 
 /// An AVIF file: an ISO-BMFF `ftyp` box with the `avif` (image) or `avis` (sequence) brand.
@@ -566,7 +669,7 @@ fn decode_avif(bytes: &[u8]) -> Result<image::RgbaImage> {
     image::RgbaImage::from_raw(width as u32, height as u32, rgba).context("decoding AVIF: unexpected pixel buffer size")
 }
 
-fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>> {
+fn encode_jpeg(img: &DynamicImage, quality: u8, extras: Extras) -> Result<Vec<u8>> {
     // JPEG has no alpha channel: composite transparent pixels onto white.
     let rgb = if img.color().has_alpha() {
         let rgba = img.to_rgba8();
@@ -588,11 +691,18 @@ fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>> {
     comp.set_progressive_mode();
     comp.set_optimize_scans(true);
     let mut started = comp.start_compress(Vec::new())?;
+    // EXIF (APP1) goes first, then the profile (APP2).
+    if let Some(exif) = extras.exif {
+        started.write_marker(mozjpeg::Marker::APP(1), &metadata::jpeg_exif_segment(exif));
+    }
+    for segment in extras.icc.map(metadata::jpeg_icc_segments).unwrap_or_default() {
+        started.write_marker(mozjpeg::Marker::APP(2), &segment);
+    }
     started.write_scanlines(rgb.as_raw())?;
     Ok(started.finish()?)
 }
 
-fn encode_webp(img: &DynamicImage, quality: u8, lossless: bool) -> Result<Vec<u8>> {
+fn encode_webp(img: &DynamicImage, quality: u8, lossless: bool, extras: Extras) -> Result<Vec<u8>> {
     let mut config = webp::WebPConfig::new().map_err(|_| anyhow!("invalid WebP config"))?;
     config.lossless = lossless as i32;
     config.quality = if lossless { 75.0 } else { quality as f32 };
@@ -607,15 +717,19 @@ fn encode_webp(img: &DynamicImage, quality: u8, lossless: bool) -> Result<Vec<u8
         webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height()).encode_advanced(&config)
     }
     .map_err(|e| anyhow!("WebP encoding failed: {e:?}"))?;
-    Ok(mem.to_vec())
+    metadata::webp_with_metadata(&mem, img.width(), img.height(), extras.icc, extras.exif)
 }
 
-fn encode_avif(img: &DynamicImage, quality: u8, speed: u8) -> Result<Vec<u8>> {
-    let encoder = ravif::Encoder::new()
+/// AVIF output is always sRGB (ravif can't embed a profile), so only EXIF comes along.
+fn encode_avif(img: &DynamicImage, quality: u8, speed: u8, exif: Option<&[u8]>) -> Result<Vec<u8>> {
+    let mut encoder = ravif::Encoder::new()
         .with_quality(quality as f32)
         .with_alpha_quality((quality as f32 + 10.0).min(100.0))
         .with_speed(speed.clamp(1, 10))
         .with_alpha_color_mode(ravif::AlphaColorMode::UnassociatedClean);
+    if let Some(exif) = exif {
+        encoder = encoder.with_exif(exif);
+    }
     let (w, h) = (img.width() as usize, img.height() as usize);
 
     let encoded = if img.color().has_alpha() {
@@ -639,18 +753,33 @@ fn encode_avif(img: &DynamicImage, quality: u8, speed: u8) -> Result<Vec<u8>> {
     Ok(encoded.avif_file)
 }
 
-fn encode_png(img: &DynamicImage, original_png: Option<&[u8]>, level: u8) -> Result<Vec<u8>> {
+fn encode_png(img: &DynamicImage, original_png: Option<&[u8]>, level: u8, extras: Extras) -> Result<Vec<u8>> {
     let png = match original_png {
+        // A kept profile is the original's own iCCP chunk, which is left in below.
         Some(bytes) => bytes.to_vec(),
         None => {
             let mut buf = Vec::new();
-            img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
+            let mut encoder = image::codecs::png::PngEncoder::new(&mut buf);
+            if let Some(icc) = extras.icc {
+                encoder.set_icc_profile(icc.to_vec()).map_err(|e| anyhow!("PNG color profile: {e}"))?;
+            }
+            img.write_with_encoder(encoder)?;
             buf
         }
     };
     let mut opts = oxipng::Options::from_preset(level.min(6));
-    opts.strip = oxipng::StripChunks::Safe;
-    oxipng::optimize_from_memory(&png, &opts).map_err(|e| anyhow!("PNG optimization failed: {e}"))
+    // What affects display (animation chunks included, for an APNG re-compressed as it is),
+    // and the profile only when it's kept. EXIF is added afterwards.
+    let mut keep = oxipng::indexset! {*b"cICP", *b"sRGB", *b"pHYs", *b"acTL", *b"fcTL", *b"fdAT"};
+    if extras.icc.is_some() {
+        keep.insert(*b"iCCP");
+    }
+    opts.strip = oxipng::StripChunks::Keep(keep);
+    let png = oxipng::optimize_from_memory(&png, &opts).map_err(|e| anyhow!("PNG optimization failed: {e}"))?;
+    match extras.exif {
+        Some(exif) => metadata::png_with_exif(&png, exif),
+        None => Ok(png),
+    }
 }
 
 /// Extensions we accept as input.
@@ -721,9 +850,9 @@ mod tests {
     fn avif_round_trips_through_the_decoder() {
         for alpha in [false, true] {
             let original = sample_image(alpha);
-            let avif = encode_avif(&original, 90, 10).unwrap();
+            let avif = encode_avif(&original, 90, 10, None).unwrap();
             assert!(is_avif(&avif));
-            let decoded = decode(&avif).unwrap().to_rgba8();
+            let decoded = decode(&avif).unwrap().image.to_rgba8();
             assert_eq!(decoded.dimensions(), (original.width(), original.height()));
             // Close to the original on average (catches wrong bit-depth scaling, swapped
             // channels or lost alpha, which are off by far more than compression).
@@ -805,7 +934,7 @@ mod tests {
         assert!(is_supported(Path::new("PHOTO.AVIF")));
         let dir = temp_dir("avif-input");
         let src = dir.join("photo.avif");
-        fs::write(&src, encode_avif(&sample_image(false), 80, 10).unwrap()).unwrap();
+        fs::write(&src, encode_avif(&sample_image(false), 80, 10, None).unwrap()).unwrap();
         let thumb = thumbnail(&src, 64).unwrap();
         assert_eq!((thumb.width, thumb.height, thumb.format), (320, 200, "AVIF"));
         let settings = Settings { webp: true, skip_if_larger: false, ..Settings::default() };
@@ -816,7 +945,7 @@ mod tests {
 
     #[test]
     fn avif_claiming_a_huge_size_is_refused_before_decoding() {
-        let mut avif = encode_avif(&sample_image(false), 60, 10).unwrap();
+        let mut avif = encode_avif(&sample_image(false), 60, 10, None).unwrap();
         assert_eq!(avif_declared_size(&avif), Some((320, 200)));
         // Rewrite every ispe box to claim 100 000 x 100 000 pixels.
         let at: Vec<usize> = avif.windows(4).enumerate().filter(|(_, w)| *w == b"ispe").map(|(i, _)| i).collect();
@@ -824,7 +953,7 @@ mod tests {
             avif[i + 8..i + 12].copy_from_slice(&100_000u32.to_be_bytes());
             avif[i + 12..i + 16].copy_from_slice(&100_000u32.to_be_bytes());
         }
-        let err = decode(&avif).unwrap_err().to_string();
+        let err = decode(&avif).map(|_| ()).unwrap_err().to_string();
         assert!(err.contains("too large"), "{err}");
     }
 
@@ -880,15 +1009,15 @@ mod tests {
         for alpha in [false, true] {
             let img = sample_image(alpha);
             for (name, data) in [
-                ("jpeg", encode_jpeg(&img, 80).unwrap()),
-                ("webp", encode_webp(&img, 80, false).unwrap()),
-                ("webp-lossless", encode_webp(&img, 80, true).unwrap()),
-                ("avif", encode_avif(&img, 60, 10).unwrap()),
-                ("png", encode_png(&img, None, 1).unwrap()),
+                ("jpeg", encode_jpeg(&img, 80, Extras::default()).unwrap()),
+                ("webp", encode_webp(&img, 80, false, Extras::default()).unwrap()),
+                ("webp-lossless", encode_webp(&img, 80, true, Extras::default()).unwrap()),
+                ("avif", encode_avif(&img, 60, 10, None).unwrap()),
+                ("png", encode_png(&img, None, 1, Extras::default()).unwrap()),
             ] {
                 assert!(data.len() > 20, "{name} alpha={alpha} produced {} bytes", data.len());
                 // Round-trip through the decoder to make sure the output is valid.
-                let back = decode(&data).unwrap();
+                let back = decode(&data).unwrap().image;
                 assert_eq!((back.width(), back.height()), (320, 200), "{name}");
             }
         }
@@ -959,6 +1088,125 @@ mod tests {
 
         // Output folder is skipped when the folder is scanned again.
         assert_eq!(collect_sources(std::slice::from_ref(&dir)).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every format, written to `dir`'s output folder with `settings` (and nothing skipped):
+    /// the bytes of each output by format.
+    fn outputs(dir: &Path, settings: Settings) -> Vec<(Format, Vec<u8>)> {
+        let settings = Settings { jpeg: true, webp: true, avif: true, png: true, avif_speed: 10, skip_if_larger: false, ..settings };
+        let sources = collect_sources(&[dir.to_path_buf()]).unwrap();
+        process(&sources[0], &settings)
+            .unwrap()
+            .into_iter()
+            .map(|r| match r.outcome {
+                Outcome::Written { path, .. } => (r.format, fs::read(path).unwrap()),
+                other => panic!("{:?}: {other:?}", r.format),
+            })
+            .collect()
+    }
+
+    /// The color profile and EXIF an image file carries (JPEG, WebP or PNG).
+    fn embedded(bytes: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let mut decoder = ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().unwrap().into_decoder().unwrap();
+        (decoder.icc_profile().unwrap(), decoder.exif_metadata().unwrap())
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn metadata_is_removed_or_kept_in_every_format() {
+        use metadata::tests::{COPYRIGHT, GPS_LATITUDE, ORIENTATION, camera_exif, has, read_exif};
+        let dir = temp_dir("metadata");
+        // A 320 x 200 photo taken with the camera turned (orientation 6: rotate 90° clockwise).
+        let exif = camera_exif(false, 6);
+        let photo = encode_jpeg(&sample_image(false), 90, Extras { icc: None, exif: Some(&exif) }).unwrap();
+        fs::write(dir.join("photo.jpg"), photo).unwrap();
+
+        for (format, data) in outputs(&dir, Settings { metadata: Metadata::Remove, ..Settings::default() }) {
+            assert!(!contains(&data, b"Gravitide"), "{format:?} kept metadata");
+        }
+
+        for (format, data) in outputs(&dir, Settings { metadata: Metadata::KeepExceptLocation, ..Settings::default() }) {
+            assert!(contains(&data, b"(c) Gravitide"), "{format:?} lost the copyright");
+            if format == Format::Avif {
+                continue; // (no AVIF metadata reader here)
+            }
+            let (main, _, gps) = read_exif(&embedded(&data).1.unwrap());
+            assert!(has(&main, COPYRIGHT), "{format:?}");
+            assert!(!has(&main, ORIENTATION) && gps.is_empty(), "{format:?}");
+            // Upright pixels, and nothing left to turn them again.
+            let img = decode(&data).unwrap().image;
+            assert_eq!((img.width(), img.height()), (200, 320), "{format:?}");
+        }
+
+        for (format, data) in outputs(&dir, Settings { metadata: Metadata::KeepAll, ..Settings::default() }) {
+            if format != Format::Avif {
+                let (_, _, gps) = read_exif(&embedded(&data).1.unwrap());
+                assert!(has(&gps, GPS_LATITUDE), "{format:?} lost the location");
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn webp_with_transparency_keeps_it_alongside_profile_and_exif() {
+        let p3 = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+        let exif = metadata::tests::camera_exif(true, 1);
+        let extras = Extras { icc: Some(&p3), exif: Some(&exif) };
+        for lossless in [false, true] {
+            let data = encode_webp(&sample_image(true), 80, lossless, extras).unwrap();
+            let (icc, found) = embedded(&data);
+            assert_eq!(icc.as_deref(), Some(&p3[..]), "lossless={lossless}");
+            assert_eq!(found.as_deref(), Some(&exif[..]), "lossless={lossless}");
+            let img = decode(&data).unwrap().image;
+            assert!(img.color().has_alpha(), "lossless={lossless}");
+            assert_eq!(img.to_rgba8().get_pixel(300, 10)[3], 64, "lossless={lossless}");
+        }
+    }
+
+    #[test]
+    fn color_profiles_are_kept_or_converted() {
+        let p3 = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+        let dir = temp_dir("color");
+        let color = image::Rgb([200u8, 60, 40]);
+        let mut png = Vec::new();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut png);
+        encoder.set_icc_profile(p3.clone()).unwrap();
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(64, 64, color)).write_with_encoder(encoder).unwrap();
+        fs::write(dir.join("p3.png"), png).unwrap();
+        let decoded = Decoded::open(&dir.join("p3.png")).unwrap();
+        assert_eq!(decoded.icc.as_deref(), Some(&p3[..]));
+        let on_screen = decoded.rgba().get_pixel(0, 0).0;
+        assert!(on_screen[0] > 200, "shown in sRGB: {on_screen:?}");
+        let close = |a: [u8; 4], b: [u8; 4], slack: u8| a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= slack);
+
+        // Kept: the pixels as they are, with the profile (AVIF: converted, it can't embed one).
+        for (format, data) in outputs(&dir, Settings { color_profile: ColorProfile::Keep, ..Settings::default() }) {
+            let raw = decode(&data).unwrap().image.to_rgba8().get_pixel(0, 0).0;
+            if format == Format::Avif {
+                assert!(close(raw, on_screen, 6), "{format:?}: {raw:?} vs {on_screen:?}");
+            } else {
+                assert_eq!(embedded(&data).0.as_deref(), Some(&p3[..]), "{format:?}");
+                assert!(close(raw, [200, 60, 40, 255], 4), "{format:?}: {raw:?}");
+            }
+        }
+        // Converted: sRGB pixels, no profile.
+        for (format, data) in outputs(&dir, Settings { color_profile: ColorProfile::Srgb, ..Settings::default() }) {
+            if format != Format::Avif {
+                assert_eq!(embedded(&data).0, None, "{format:?}");
+            }
+            let raw = decode(&data).unwrap().image.to_rgba8().get_pixel(0, 0).0;
+            assert!(close(raw, on_screen, 6), "{format:?}: {raw:?} vs {on_screen:?}");
+        }
+        // Either way, the preview looks the same.
+        for color_profile in [ColorProfile::Keep, ColorProfile::Srgb] {
+            let settings = Settings { color_profile, ..Settings::default() };
+            let shown = preview(&decoded, Format::Png, &settings).unwrap().pixels.get_pixel(0, 0).0;
+            assert!(close(shown, on_screen, 1), "{color_profile:?}: {shown:?} vs {on_screen:?}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

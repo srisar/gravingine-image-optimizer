@@ -15,7 +15,7 @@ use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 use winapi::shared::windef::HWND;
 
-use crate::optimizer::{self, Format, FormatResult, OutputLocation, Outcome, ResizeMode, Settings, Source};
+use crate::optimizer::{self, ColorProfile, Format, FormatResult, Metadata, OutputLocation, Outcome, ResizeMode, Settings, Source};
 use crate::taskbar::{self, Taskbar};
 use crate::presets::{self, Look, Preset};
 use crate::{AppWindow, CompareFormat, TileData, Ui, winicon};
@@ -1245,6 +1245,15 @@ impl App {
         let (value, unit) = if kb >= 1024 && kb.is_multiple_of(1024) { (kb / 1024, 1) } else { (kb, 0) };
         ui.set_target_value(value.to_string().into());
         ui.set_target_unit(unit);
+        ui.set_color_profile(match s.color_profile {
+            ColorProfile::Keep => 0,
+            ColorProfile::Srgb => 1,
+        });
+        ui.set_metadata_mode(match s.metadata {
+            Metadata::Remove => 0,
+            Metadata::KeepExceptLocation => 1,
+            Metadata::KeepAll => 2,
+        });
     }
 
     fn read_settings(&self) -> Settings {
@@ -1280,6 +1289,12 @@ impl App {
             target_kb: {
                 let value = num(ui.get_target_value(), 200).max(1);
                 if ui.get_target_unit() == 1 { value.saturating_mul(1024) } else { value }
+            },
+            color_profile: if ui.get_color_profile() == 1 { ColorProfile::Srgb } else { ColorProfile::Keep },
+            metadata: match ui.get_metadata_mode() {
+                1 => Metadata::KeepExceptLocation,
+                2 => Metadata::KeepAll,
+                _ => Metadata::Remove,
             },
             max_width: num(ui.get_limit_width(), 0),
             max_height: num(ui.get_limit_height(), 0),
@@ -1754,6 +1769,20 @@ mod snapshot {
                 a.sync();
             });
         }
+        // GIO_SNAPSHOT_COLOR=<n> / GIO_SNAPSHOT_METADATA=<n>: the n-th color profile / metadata
+        // choice (e.g. 1 = Convert to sRGB / Keep, except location).
+        let choice = |name| var(name).and_then(|v| v.parse::<i32>().ok());
+        if let Some(n) = choice("GIO_SNAPSHOT_COLOR") {
+            with_app(|a| a.ui.set_color_profile(n));
+        }
+        if let Some(n) = choice("GIO_SNAPSHOT_METADATA") {
+            with_app(|a| a.ui.set_metadata_mode(n));
+        }
+        // GIO_SNAPSHOT_INFO=<n>: a "How it works" dialog (1 target file size, 2 color profile
+        // and metadata).
+        if let Some(n) = choice("GIO_SNAPSHOT_INFO") {
+            with_app(|a| a.ui.set_info_topic(n));
+        }
         // GIO_SNAPSHOT_CLEAR=1: "Clear images from the list once optimized" on (otherwise off,
         // whatever the saved settings say, so runs leave their tiles to look at).
         with_app(|a| a.ui.set_clear_when_done(var("GIO_SNAPSHOT_CLEAR").is_some()));
@@ -1773,9 +1802,27 @@ mod snapshot {
             if var("GIO_SNAPSHOT_RUN").is_some() {
                 with_app(App::start);
             } else if !compare_then_capture() {
-                capture();
+                click_then_capture();
             }
         });
+    }
+
+    /// With `GIO_SNAPSHOT_CLICK=<x>,<y>` (logical pixels): click there first (to open a
+    /// drop-down list, say), then capture.
+    fn click_then_capture() {
+        let point = var("GIO_SNAPSHOT_CLICK").and_then(|v| {
+            let (x, y) = v.split_once(',')?;
+            Some(slint::LogicalPosition::new(x.trim().parse().ok()?, y.trim().parse().ok()?))
+        });
+        let Some(position) = point else { return capture() };
+        with_app(|a| {
+            use slint::platform::{PointerEventButton, WindowEvent};
+            let window = a.ui.window();
+            window.dispatch_event(WindowEvent::PointerMoved { position });
+            window.dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
+            window.dispatch_event(WindowEvent::PointerReleased { position, button: PointerEventButton::Left });
+        });
+        slint::Timer::single_shot(Duration::from_millis(400), capture);
     }
 
     pub fn on_run_started() {

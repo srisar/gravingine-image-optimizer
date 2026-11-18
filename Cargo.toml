@@ -8,8 +8,10 @@ repository = "https://github.com/srisar/gravingine-image-optimizer"
 [dependencies]
 anyhow = "1.0.104"
 avif-decode = { version = "3.0.0", default-features = false }
+crc32fast = "1.5.5"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff", "ico"] }
 imgref = "1.12.3"
+moxcms = "0.8.1"
 mozjpeg = "0.10.13"
 oxipng = { version = "10.2.1", default-features = false, features = ["parallel"] }
 ravif = "0.13.0"
