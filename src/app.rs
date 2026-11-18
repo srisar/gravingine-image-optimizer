@@ -60,7 +60,6 @@ impl ResizeChoice {
 }
 /// Thumbnail size in the list (logical pixels).
 const THUMB: f32 = 72.0;
-const IMAGE_EXTENSIONS: [&str; 10] = ["jpg", "jpeg", "jfif", "png", "webp", "gif", "bmp", "tif", "tiff", "ico"];
 
 #[derive(Clone, Debug)]
 enum Status {
@@ -115,6 +114,18 @@ struct CompareOutput {
     format: Format,
     path: PathBuf,
     size: u64,
+    /// The quality picked for the target file size, and the target it aimed for (bytes).
+    quality: Option<u8>,
+    target: Option<u64>,
+}
+
+/// The output on the right of the split line: its pixels and file size, the quality picked
+/// for the target file size, and the target when it wasn't met.
+struct OutputPixels {
+    pixels: PixelBuffer,
+    size: u64,
+    quality: Option<u8>,
+    missed_target: Option<u64>,
 }
 
 /// What a comparison worker sends back.
@@ -125,13 +136,13 @@ struct CompareResult {
     /// The original's pixels, when they weren't on screen yet.
     original: Option<PixelBuffer>,
     /// The output's pixels and file size, unless there was nothing to show.
-    output: Option<Result<(PixelBuffer, u64), String>>,
+    output: Option<Result<OutputPixels, String>>,
 }
 
 /// What a comparison worker should produce on the right of the split line.
 enum CompareJob {
     Nothing,
-    Saved { path: PathBuf, size: u64 },
+    Saved { path: PathBuf, size: u64, quality: Option<u8>, target: Option<u64> },
     Preview { format: Format, settings: Settings },
 }
 
@@ -148,7 +159,13 @@ fn compare_outputs(job: &Job) -> Vec<CompareOutput> {
     results
         .iter()
         .filter_map(|r| match &r.outcome {
-            Outcome::Written { path, size } => Some(CompareOutput { format: r.format, path: path.clone(), size: *size }),
+            Outcome::Written { path, size } => Some(CompareOutput {
+                format: r.format,
+                path: path.clone(),
+                size: *size,
+                quality: r.quality,
+                target: r.target,
+            }),
             _ => None,
         })
         .collect()
@@ -417,7 +434,7 @@ impl App {
 
     fn add_files(&self) {
         let files = self.ui.window().with_winit_window(|w| {
-            rfd::FileDialog::new().set_title("Add images").add_filter("Images", &IMAGE_EXTENSIONS).set_parent(w).pick_files()
+            rfd::FileDialog::new().set_title("Add images").add_filter("Images", optimizer::INPUT_EXTENSIONS).set_parent(w).pick_files()
         });
         if let Some(files) = files.flatten() {
             self.add_paths(files);
@@ -860,7 +877,7 @@ impl App {
                 None => CompareJob::Nothing,
                 Some(format) if c.preview => CompareJob::Preview { format, settings },
                 Some(format) => match c.saved.iter().find(|o| o.format == format) {
-                    Some(o) => CompareJob::Saved { path: o.path.clone(), size: o.size },
+                    Some(o) => CompareJob::Saved { path: o.path.clone(), size: o.size, quality: o.quality, target: o.target },
                     None => CompareJob::Nothing,
                 },
             };
@@ -885,11 +902,25 @@ impl App {
             let original = if need_original { decoded.as_ref().ok().map(|d| pixel_buffer(d.rgba())) } else { None };
             let output = match job {
                 CompareJob::Nothing => None,
-                CompareJob::Saved { path, size } => {
-                    Some(optimizer::load_rgba(&path).map(|p| (pixel_buffer(p), size)).map_err(text))
-                }
+                CompareJob::Saved { path, size, quality, target } => Some(
+                    optimizer::load_rgba(&path)
+                        .map(|p| OutputPixels {
+                            pixels: pixel_buffer(p),
+                            size,
+                            quality,
+                            missed_target: target.filter(|t| size > *t),
+                        })
+                        .map_err(text),
+                ),
                 CompareJob::Preview { format, settings } => Some(match &decoded {
-                    Ok(d) => optimizer::preview(d, format, &settings).map(|(size, p)| (pixel_buffer(p), size)).map_err(text),
+                    Ok(d) => optimizer::preview(d, format, &settings)
+                        .map(|p| OutputPixels {
+                            pixels: pixel_buffer(p.pixels),
+                            size: p.size,
+                            quality: p.quality,
+                            missed_target: settings.target_bytes().filter(|_| p.over_target),
+                        })
+                        .map_err(text),
                     Err(e) => Err(e.clone()),
                 }),
             };
@@ -900,7 +931,7 @@ impl App {
 
     fn compare_loaded(&self, result: CompareResult) {
         let settings = self.read_settings();
-        let (label, original_size, preview, again) = {
+        let (format, original_size, preview, again) = {
             let mut st = self.state.borrow_mut();
             // Closed, or another image opened since.
             let Some(c) = st.compare.as_mut().filter(|c| c.original == result.original_path) else { return };
@@ -910,13 +941,15 @@ impl App {
             if let Ok(d) = &result.decoded {
                 c.decoded.get_or_insert_with(|| d.clone());
             }
-            let format = c.current.map(|i| c.formats[i]);
-            let label = match format {
-                Some(f) if c.preview => format_setting(f, &settings),
-                Some(f) => f.label().to_string(),
-                None => String::new(),
-            };
-            (label, c.original_size, c.preview, c.dirty)
+            (c.current.map(|i| c.formats[i]), c.original_size, c.preview, c.dirty)
+        };
+        // "WebP at 71%" when a target file size picked the quality; otherwise the setting
+        // (preview) or just the format (saved).
+        let label = match (format, result.output.as_ref().and_then(|o| o.as_ref().ok()).and_then(|o| o.quality)) {
+            (Some(f), Some(q)) => format!("{} at {q}%", f.label()),
+            (Some(f), None) if preview => format_setting(f, &settings),
+            (Some(f), None) => f.label().to_string(),
+            (None, _) => String::new(),
         };
         let ui = &self.ui;
         let mut problem = None;
@@ -929,10 +962,10 @@ impl App {
             problem = Some(format!("Couldn't open the original: {e}"));
         }
         match result.output {
-            Some(Ok((buffer, size))) => {
+            Some(Ok(OutputPixels { pixels: buffer, size, missed_target, .. })) => {
                 let larger = size >= original_size;
                 let pct = savings_pct(original_size, size).abs().round();
-                let (saving, detail) = if larger {
+                let (saving, mut detail) = if larger {
                     let detail = if preview && settings.skip_if_larger {
                         "would be skipped".to_string()
                     } else {
@@ -942,13 +975,16 @@ impl App {
                 } else {
                     (format!("\u{2212}{pct:.0}%"), format!("saves {}", human_size(original_size - size)))
                 };
+                if let Some(target) = missed_target {
+                    detail = format!("couldn't get under {}", target_text(target));
+                }
                 let caption = if preview { format!("{label} · not saved yet") } else { format!("{label} · saved") };
                 ui.set_compare_output_caption(caption.into());
                 ui.set_compare_output_size(human_size(size).into());
                 ui.set_compare_output_dims(format!("{} × {}", buffer.width(), buffer.height()).into());
                 ui.set_compare_saving(saving.into());
                 ui.set_compare_saving_detail(detail.into());
-                ui.set_compare_output_tone(if larger { 2 } else { 1 });
+                ui.set_compare_output_tone(if larger || missed_target.is_some() { 2 } else { 1 });
                 ui.set_compare_output_label(if preview { format!("Preview: {label}") } else { label }.into());
                 ui.set_compare_output(Image::from_rgba8(buffer));
             }
@@ -1204,6 +1240,11 @@ impl App {
         ui.set_skip_larger(s.skip_if_larger);
         ui.set_overwrite(s.overwrite);
         ui.set_clear_when_done(s.clear_when_done);
+        ui.set_target_size(s.target_size);
+        let kb = s.target_kb.max(1);
+        let (value, unit) = if kb >= 1024 && kb.is_multiple_of(1024) { (kb / 1024, 1) } else { (kb, 0) };
+        ui.set_target_value(value.to_string().into());
+        ui.set_target_unit(unit);
     }
 
     fn read_settings(&self) -> Settings {
@@ -1235,6 +1276,11 @@ impl App {
             resize_percent,
             box_width,
             box_height,
+            target_size: ui.get_target_size(),
+            target_kb: {
+                let value = num(ui.get_target_value(), 200).max(1);
+                if ui.get_target_unit() == 1 { value.saturating_mul(1024) } else { value }
+            },
             max_width: num(ui.get_limit_width(), 0),
             max_height: num(ui.get_limit_height(), 0),
             output: if ui.get_save_mode() == 1 && !dir.is_empty() {
@@ -1346,8 +1392,10 @@ fn tile_view(job: &Job, plan: &str, settings: &Settings) -> TileData {
             _ => None,
         })
         .min();
+    // An output still over the target file size (even at the lowest quality).
+    let missed_target = results.iter().any(FormatResult::over_target);
     let (out_size, out_tone) = match (&job.status, smallest) {
-        (Status::Done(_), Some(size)) => (human_size(size), TONE_SUCCESS),
+        (Status::Done(_), Some(size)) => (human_size(size), if missed_target { TONE_CAUTION } else { TONE_SUCCESS }),
         (Status::Done(_), None) if results.iter().any(|r| matches!(r.outcome, Outcome::Larger { .. })) => {
             ("skipped".to_string(), TONE_CAUTION)
         }
@@ -1366,6 +1414,8 @@ fn tile_view(job: &Job, plan: &str, settings: &Settings) -> TileData {
         Status::Done(_) => {
             let (tone, badge) = if error.is_some() {
                 (TONE_CRITICAL, BADGE_ERROR)
+            } else if missed_target {
+                (TONE_CAUTION, BADGE_SKIPPED)
             } else if written {
                 (TONE_SUCCESS, BADGE_DONE)
             } else {
@@ -1413,7 +1463,16 @@ fn result_text(results: &[FormatResult], original: u64) -> String {
         .iter()
         .map(|r| match &r.outcome {
             Outcome::Written { size, .. } => {
-                format!("{} {} ({:+.0}%)", r.format.label(), human_size(*size), -savings_pct(original, *size))
+                // "WebP 196.8 KB (−54%) at 71%", "... at 10%: couldn't get under 200 KB"
+                let mut text =
+                    format!("{} {} ({:+.0}%)", r.format.label(), human_size(*size), -savings_pct(original, *size));
+                if let Some(q) = r.quality {
+                    text.push_str(&format!(" at {q}%"));
+                }
+                if let (true, Some(target)) = (r.over_target(), r.target) {
+                    text.push_str(&format!(": couldn't get under {}", target_text(target)));
+                }
+                text
             }
             Outcome::Larger { size } => format!("{} skipped, {:.0}% larger", r.format.label(), -savings_pct(original, *size)),
             Outcome::Failed(_) => format!("{} failed", r.format.label()),
@@ -1433,12 +1492,39 @@ fn format_setting(format: Format, s: &Settings) -> String {
     }
 }
 
+/// "WebP at 78%, AVIF at 65%", or with a target file size "WebP, PNG lossless, highest
+/// quality under 200 KB"; `None` when no format is on.
+fn formats_text(s: &Settings) -> Option<String> {
+    let formats = s.formats();
+    if formats.is_empty() {
+        return None;
+    }
+    let target = s.target_bytes().filter(|_| formats.iter().any(|f| s.quality(*f).is_some()));
+    let mut parts: Vec<String> = formats
+        .into_iter()
+        .map(|f| match (target, s.quality(f)) {
+            // The target picks the quality.
+            (Some(_), Some(_)) => f.label().to_string(),
+            _ => format_setting(f, s),
+        })
+        .collect();
+    if let Some(target) = target {
+        parts.push(format!("highest quality under {}", target_text(target)));
+    }
+    Some(parts.join(", "))
+}
+
+/// "200 KB", "1 MB": a target file size given in bytes.
+fn target_text(bytes: u64) -> String {
+    let kb = bytes / 1024;
+    if kb >= 1024 && kb.is_multiple_of(1024) { format!("{} MB", kb / 1024) } else { format!("{kb} KB") }
+}
+
 /// "To WebP at 78%, AVIF at 65% · resized to 50%": what the current settings will produce.
 fn plan_text(s: &Settings) -> String {
-    let formats: Vec<String> = s.formats().into_iter().map(|f| format_setting(f, s)).collect();
-    if formats.is_empty() {
+    let Some(formats) = formats_text(s) else {
         return "No output format selected".into();
-    }
+    };
     let size = match (s.resize, s.resize_mode) {
         (false, _) => "original size".to_string(),
         (true, ResizeMode::Percent) => format!("resized to {}%", s.resize_percent),
@@ -1448,7 +1534,7 @@ fn plan_text(s: &Settings) -> String {
             format!("fit {} × {}", side(s.max_width), side(s.max_height))
         }
     };
-    format!("To {} · {size}", formats.join(", "))
+    format!("To {formats} · {size}")
 }
 
 /// First error for a job: the whole file failed, or one of its formats did.
@@ -1464,11 +1550,16 @@ fn row_error(job: &Job) -> Option<String> {
 }
 
 /// "Clear images from the list once optimized": images that finished without errors leave
-/// the list (failures stay, so their errors can be read; unticked images weren't part of the
-/// run). Their totals move into the status line, since their tiles are gone.
+/// the list (failures and missed target sizes stay, so they can be looked at; unticked
+/// images weren't part of the run). Their totals move into the status line, since their
+/// tiles are gone.
 fn clear_optimized(st: &mut State, secs: f32, cancelled: bool) {
-    let (cleared, kept): (Vec<Job>, Vec<Job>) =
-        std::mem::take(&mut st.jobs).into_iter().partition(|j| matches!(j.status, Status::Done(_)) && row_error(j).is_none());
+    // Images that missed the target file size stay too: they need a look, like errors.
+    let clean = |j: &Job| match &j.status {
+        Status::Done(results) => row_error(j).is_none() && !results.iter().any(FormatResult::over_target),
+        _ => false,
+    };
+    let (cleared, kept): (Vec<Job>, Vec<Job>) = std::mem::take(&mut st.jobs).into_iter().partition(clean);
     st.jobs = kept;
     if cleared.is_empty() {
         return;
@@ -1537,8 +1628,7 @@ fn run_jobs(work: Vec<(usize, Source)>, settings: Settings, cancel: Arc<AtomicBo
 fn look_summary(look: &Look) -> String {
     let mut s = Settings::default();
     look.apply(&mut s);
-    let formats: Vec<String> = s.formats().into_iter().map(|f| format_setting(f, &s)).collect();
-    let formats = if formats.is_empty() { "No output format".to_string() } else { formats.join(", ") };
+    let formats = formats_text(&s).unwrap_or_else(|| "No output format".to_string());
     let size = match (s.resize, s.resize_mode) {
         (false, _) => "original size".to_string(),
         (true, ResizeMode::Box) => RESIZE_CHOICES
@@ -1655,9 +1745,21 @@ mod snapshot {
         if let Some(name) = var("GIO_SNAPSHOT_SAVE_PRESET") {
             with_app(|a| a.save_preset(&name));
         }
-        // GIO_SNAPSHOT_CLEAR=1: "Clear images from the list once optimized" on.
-        if var("GIO_SNAPSHOT_CLEAR").is_some() {
-            with_app(|a| a.ui.set_clear_when_done(true));
+        // GIO_SNAPSHOT_TARGET=<KB>: target file size on, at that many KB.
+        if let Some(kb) = var("GIO_SNAPSHOT_TARGET").and_then(|v| v.parse::<u32>().ok()) {
+            with_app(|a| {
+                a.ui.set_target_size(true);
+                a.ui.set_target_value(kb.to_string().into());
+                a.ui.set_target_unit(0);
+                a.sync();
+            });
+        }
+        // GIO_SNAPSHOT_CLEAR=1: "Clear images from the list once optimized" on (otherwise off,
+        // whatever the saved settings say, so runs leave their tiles to look at).
+        with_app(|a| a.ui.set_clear_when_done(var("GIO_SNAPSHOT_CLEAR").is_some()));
+        // GIO_SNAPSHOT_SCROLL=<px>: scroll the settings pane down.
+        if let Some(px) = var("GIO_SNAPSHOT_SCROLL").and_then(|v| v.parse::<f32>().ok()) {
+            with_app(|a| a.ui.set_settings_scroll(-px));
         }
         if let Some(index) = var("GIO_SNAPSHOT_RESIZE").and_then(|v| v.parse::<i32>().ok()) {
             with_app(|a| {
@@ -1720,8 +1822,11 @@ mod snapshot {
                 })
             });
         }
-        // Decoding and encoding full-size images takes a moment.
-        let wait = if retune.is_some() { 4000 } else { 2000 };
+        // Decoding and encoding full-size images takes a moment. GIO_SNAPSHOT_WAIT=<ms> captures
+        // sooner (or later), e.g. while the preview is still being made.
+        let wait = var("GIO_SNAPSHOT_WAIT")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(if retune.is_some() { 4000 } else { 2000 });
         slint::Timer::single_shot(Duration::from_millis(wait), capture);
         true
     }

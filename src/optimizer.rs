@@ -91,6 +91,13 @@ pub struct Settings {
     pub box_width: u32,
     pub box_height: u32,
 
+    /// Keep each output under `target_kb` at the highest quality that fits, for JPEG, lossy
+    /// WebP and AVIF (their quality settings are set aside). PNG and lossless WebP aren't
+    /// changed.
+    pub target_size: bool,
+    /// The size limit, in KB (1024 bytes).
+    pub target_kb: u32,
+
     pub output: OutputLocation,
     /// Don't write an output that is not smaller than the original file.
     pub skip_if_larger: bool,
@@ -119,6 +126,8 @@ impl Default for Settings {
             resize_percent: 50,
             box_width: 1920,
             box_height: 1080,
+            target_size: false,
+            target_kb: 200,
             output: OutputLocation::Subfolder,
             skip_if_larger: true,
             overwrite: true,
@@ -141,7 +150,38 @@ impl Settings {
     pub fn formats(&self) -> Vec<Format> {
         Format::ALL.into_iter().filter(|f| self.enabled(*f)).collect()
     }
+
+    /// The size limit in bytes, when one is on.
+    pub fn target_bytes(&self) -> Option<u64> {
+        (self.target_size && self.target_kb > 0).then(|| self.target_kb as u64 * 1024)
+    }
+
+    /// The quality setting of a lossy format; `None` for PNG and lossless WebP.
+    pub fn quality(&self, format: Format) -> Option<u8> {
+        match format {
+            Format::Jpeg => Some(self.jpeg_quality),
+            Format::WebP if !self.webp_lossless => Some(self.webp_quality),
+            Format::Avif => Some(self.avif_quality),
+            Format::WebP | Format::Png => None,
+        }
+    }
+
+    /// The same settings with `format`'s quality set to `quality`.
+    fn with_quality(&self, format: Format, quality: u8) -> Settings {
+        let mut s = self.clone();
+        match format {
+            Format::Jpeg => s.jpeg_quality = quality,
+            Format::WebP => s.webp_quality = quality,
+            Format::Avif => s.avif_quality = quality,
+            Format::Png => {}
+        }
+        s
+    }
 }
+
+/// The quality range a target file size picks from.
+pub const MIN_TARGET_QUALITY: u8 = 10;
+pub const MAX_TARGET_QUALITY: u8 = 100;
 
 /// One source image plus where its outputs go.
 #[derive(Clone, Debug)]
@@ -165,6 +205,28 @@ pub enum Outcome {
 pub struct FormatResult {
     pub format: Format,
     pub outcome: Outcome,
+    /// The quality picked to meet the target file size (when one was set for a lossy format).
+    pub quality: Option<u8>,
+    /// The target file size this output aimed for, in bytes.
+    pub target: Option<u64>,
+}
+
+impl FormatResult {
+    /// Written, but still larger than the target file size (even at the lowest quality).
+    pub fn over_target(&self) -> bool {
+        match (&self.outcome, self.target) {
+            (Outcome::Written { size, .. }, Some(target)) => *size > target,
+            _ => false,
+        }
+    }
+}
+
+/// An encoded output, with the quality picked to meet the target size (if one is set).
+pub struct Encoded {
+    pub data: Vec<u8>,
+    pub quality: Option<u8>,
+    /// Still over the target at the lowest quality.
+    pub over_target: bool,
 }
 
 pub fn output_dir(src: &Source, settings: &Settings) -> PathBuf {
@@ -244,14 +306,73 @@ impl Decoded {
         }))
         .unwrap_or_else(|_| Err(anyhow!("encoder crashed")))
     }
+
+    /// Encode as `format`, meeting the target file size if one is set: the highest quality
+    /// (from `MAX_TARGET_QUALITY` down to `MIN_TARGET_QUALITY`, whatever the format's quality
+    /// setting) whose output fits, found by a binary search to within 2 points. If even the
+    /// lowest quality is too big, that smallest output is returned, marked as over the target.
+    /// With "skip files larger than the original" on, it also keeps under the original's size.
+    fn encode_sized(&self, img: &DynamicImage, resized: bool, format: Format, settings: &Settings) -> Result<Encoded> {
+        let top = MAX_TARGET_QUALITY;
+        let (Some(target), Some(_)) = (settings.target_bytes(), settings.quality(format)) else {
+            let data = self.encode(img, resized, format, settings)?;
+            return Ok(Encoded { data, quality: None, over_target: false });
+        };
+        // With "skip files larger than the original" on, a larger output would be thrown
+        // away, so it also has to come out smaller than the original.
+        let budget = if settings.skip_if_larger { target.min(self.file_size().saturating_sub(1)) } else { target };
+        let at = |quality: u8| self.encode(img, resized, format, &settings.with_quality(format, quality));
+        let fits = |data: &[u8]| data.len() as u64 <= budget;
+        let done = |data: Vec<u8>, quality: u8| {
+            let over_target = data.len() as u64 > target;
+            Ok(Encoded { data, quality: Some(quality), over_target })
+        };
+
+        let first = at(top)?;
+        if fits(&first) {
+            return done(first, top);
+        }
+        let lowest = at(MIN_TARGET_QUALITY)?;
+        if !fits(&lowest) {
+            return done(lowest, MIN_TARGET_QUALITY);
+        }
+        // `lo` fits and `hi` doesn't; narrow down.
+        let (mut lo, mut hi, mut best) = (MIN_TARGET_QUALITY, top, lowest);
+        while hi - lo > 2 {
+            let mid = lo + (hi - lo) / 2;
+            let data = at(mid)?;
+            if fits(&data) {
+                (lo, best) = (mid, data);
+            } else {
+                hi = mid;
+            }
+        }
+        done(best, lo)
+    }
 }
 
-/// What `format` with `settings` would produce, without saving anything: the encoded size
-/// and its pixels decoded back (so compression artifacts show).
-pub fn preview(decoded: &Decoded, format: Format, settings: &Settings) -> Result<(u64, image::RgbaImage)> {
+/// What `format` with `settings` would produce, without saving anything (see [`preview`]).
+pub struct Preview {
+    /// Encoded size in bytes.
+    pub size: u64,
+    /// The encoded output decoded back, so compression artifacts show.
+    pub pixels: image::RgbaImage,
+    /// The quality picked to meet the target file size, if one is set.
+    pub quality: Option<u8>,
+    pub over_target: bool,
+}
+
+/// Encode `format` with `settings` in memory (meeting the target file size, if one is set)
+/// and decode it back, without saving anything.
+pub fn preview(decoded: &Decoded, format: Format, settings: &Settings) -> Result<Preview> {
     let (img, resized) = decoded.resized(settings);
-    let data = decoded.encode(&img, resized, format, settings)?;
-    Ok((data.len() as u64, decode(&data)?.to_rgba8()))
+    let encoded = decoded.encode_sized(&img, resized, format, settings)?;
+    Ok(Preview {
+        size: encoded.data.len() as u64,
+        pixels: decode(&encoded.data)?.to_rgba8(),
+        quality: encoded.quality,
+        over_target: encoded.over_target,
+    })
 }
 
 /// Decode, optionally resize and encode one source to every enabled format.
@@ -270,10 +391,12 @@ pub fn process(src: &Source, settings: &Settings) -> Result<Vec<FormatResult>> {
         .formats()
         .into_iter()
         .map(|format| {
-            let encoded = decoded.encode(&img, resized, format, settings);
+            let encoded = decoded.encode_sized(&img, resized, format, settings);
+            let quality = encoded.as_ref().ok().and_then(|e| e.quality);
+            let target = settings.target_bytes().filter(|_| settings.quality(format).is_some());
             let outcome = match encoded {
                 Err(e) => Outcome::Failed(format!("{e:#}")),
-                Ok(data) => {
+                Ok(Encoded { data, .. }) => {
                     let size = data.len() as u64;
                     if settings.skip_if_larger && size >= original_size {
                         Outcome::Larger { size }
@@ -286,7 +409,7 @@ pub fn process(src: &Source, settings: &Settings) -> Result<Vec<FormatResult>> {
                     }
                 }
             };
-            FormatResult { format, outcome }
+            FormatResult { format, outcome, quality, target }
         })
         .collect();
 
@@ -356,6 +479,7 @@ pub fn thumbnail(path: &Path, size: u32) -> Result<Thumbnail> {
         Ok(image::ImageFormat::Bmp) => "BMP",
         Ok(image::ImageFormat::Tiff) => "TIFF",
         Ok(image::ImageFormat::Ico) => "ICO",
+        Ok(image::ImageFormat::Avif) => "AVIF",
         _ => "Image",
     };
     let img = decode(&bytes)?;
@@ -530,7 +654,7 @@ fn encode_png(img: &DynamicImage, original_png: Option<&[u8]>, level: u8) -> Res
 }
 
 /// Extensions we accept as input.
-pub const INPUT_EXTENSIONS: &[&str] = &["jpg", "jpeg", "jfif", "png", "webp", "gif", "bmp", "tif", "tiff", "ico"];
+pub const INPUT_EXTENSIONS: &[&str] = &["jpg", "jpeg", "jfif", "png", "webp", "avif", "gif", "bmp", "tif", "tiff", "ico"];
 
 pub fn is_supported(path: &Path) -> bool {
     path.extension()
@@ -615,6 +739,81 @@ mod tests {
         }
     }
 
+    /// A detailed (noisy) image that doesn't compress well, so file sizes depend on quality.
+    fn noisy_image() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(400, 300, |x, y| {
+            let n = |k: u32| ((x.wrapping_mul(7919) ^ y.wrapping_mul(104_729).wrapping_add(k)) % 251) as u8;
+            image::Rgb([n(1), n(2), n(3)])
+        }))
+    }
+
+    #[test]
+    fn target_size_picks_the_highest_quality_that_fits() {
+        let dir = temp_dir("target");
+        let src = dir.join("noise.png");
+        noisy_image().save(&src).unwrap();
+        let decoded = Decoded::open(&src).unwrap();
+        let base = Settings { jpeg: true, webp: false, jpeg_quality: 90, skip_if_larger: false, ..Settings::default() };
+        let full = preview(&decoded, Format::Jpeg, &base).unwrap();
+        assert_eq!(full.quality, None, "no target: the quality setting as is");
+
+        // A target well below the 90% size: a lower quality that fits.
+        let target_kb = (full.size * 6 / 10 / 1024) as u32;
+        let sized = Settings { target_size: true, target_kb, ..base.clone() };
+        let fit = preview(&decoded, Format::Jpeg, &sized).unwrap();
+        let q = fit.quality.unwrap();
+        assert!(fit.size <= target_kb as u64 * 1024, "{} > {target_kb} KB", fit.size);
+        assert!((MIN_TARGET_QUALITY..90).contains(&q), "quality {q}");
+        assert!(!fit.over_target);
+        // Within 2 points of the best: 3 points higher doesn't fit.
+        let higher = preview(&decoded, Format::Jpeg, &Settings { target_size: false, jpeg_quality: q + 3, ..base.clone() }).unwrap();
+        assert!(higher.size > target_kb as u64 * 1024, "quality {} would also fit", q + 3);
+
+        // The quality setting doesn't hold it back: with the slider at 80% and room for more,
+        // it goes above 80% (up to 100% when even that fits).
+        let at = |quality| preview(&decoded, Format::Jpeg, &Settings { jpeg_quality: quality, ..base.clone() }).unwrap().size;
+        let (q80, q100) = (at(80), at(100));
+        let between = Settings { target_size: true, target_kb: ((q80 + q100) / 2 / 1024) as u32, jpeg_quality: 80, ..base.clone() };
+        let up = preview(&decoded, Format::Jpeg, &between).unwrap();
+        assert!(up.quality.unwrap() > 80, "quality {:?} with room above 80%", up.quality);
+        let roomy = Settings { target_kb: (q100 / 1024 + 1) as u32, ..between };
+        assert_eq!(preview(&decoded, Format::Jpeg, &roomy).unwrap().quality, Some(MAX_TARGET_QUALITY));
+
+        // With "skip files larger than the original" on, it also stays under the original's
+        // size, so the output isn't thrown away (the budget here is bigger than the original).
+        let original = decoded.file_size();
+        let skip = Settings { skip_if_larger: true, target_kb: (original.max(q100) / 1024 + 64) as u32, ..roomy };
+        let kept = preview(&decoded, Format::Jpeg, &skip).unwrap();
+        assert!(kept.size < original, "{} >= original {original}", kept.size);
+        assert!(!kept.over_target);
+
+        // Out of reach: the lowest quality, flagged.
+        let tiny = preview(&decoded, Format::Jpeg, &Settings { target_kb: 1, ..sized.clone() }).unwrap();
+        assert_eq!(tiny.quality, Some(MIN_TARGET_QUALITY));
+        assert!(tiny.over_target);
+
+        // Lossless formats aren't changed by a target.
+        let png = preview(&decoded, Format::Png, &Settings { png: true, ..sized }).unwrap();
+        assert_eq!(png.quality, None);
+        assert!(!png.over_target);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn avif_files_are_accepted_as_input() {
+        assert!(is_supported(Path::new("photo.avif")));
+        assert!(is_supported(Path::new("PHOTO.AVIF")));
+        let dir = temp_dir("avif-input");
+        let src = dir.join("photo.avif");
+        fs::write(&src, encode_avif(&sample_image(false), 80, 10).unwrap()).unwrap();
+        let thumb = thumbnail(&src, 64).unwrap();
+        assert_eq!((thumb.width, thumb.height, thumb.format), (320, 200, "AVIF"));
+        let settings = Settings { webp: true, skip_if_larger: false, ..Settings::default() };
+        let results = process(&collect_sources(std::slice::from_ref(&src)).unwrap()[0], &settings).unwrap();
+        assert!(matches!(results[0].outcome, Outcome::Written { .. }), "{:?}", results[0].outcome);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn avif_claiming_a_huge_size_is_refused_before_decoding() {
         let mut avif = encode_avif(&sample_image(false), 60, 10).unwrap();
@@ -637,9 +836,9 @@ mod tests {
         let decoded = Decoded::open(&src_path).unwrap();
         let settings = Settings { resize: true, max_width: 160, max_height: 0, ..Settings::default() };
         for format in [Format::Jpeg, Format::WebP, Format::Png] {
-            let (size, pixels) = preview(&decoded, format, &settings).unwrap();
-            assert!(size > 0, "{format:?}");
-            assert_eq!(pixels.dimensions(), (160, 100), "{format:?}");
+            let preview = preview(&decoded, format, &settings).unwrap();
+            assert!(preview.size > 0, "{format:?}");
+            assert_eq!(preview.pixels.dimensions(), (160, 100), "{format:?}");
         }
         // Nothing is written next to the image.
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);

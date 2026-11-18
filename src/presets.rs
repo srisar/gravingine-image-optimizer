@@ -29,6 +29,8 @@ pub struct Look {
     pub resize_percent: u32,
     pub box_width: u32,
     pub box_height: u32,
+    pub target_size: bool,
+    pub target_kb: u32,
 }
 
 impl Default for Look {
@@ -58,6 +60,8 @@ impl Look {
             resize_percent: s.resize_percent,
             box_width: s.box_width,
             box_height: s.box_height,
+            target_size: s.target_size,
+            target_kb: s.target_kb,
         }
     }
 
@@ -80,6 +84,8 @@ impl Look {
         s.resize_percent = self.resize_percent;
         s.box_width = self.box_width;
         s.box_height = self.box_height;
+        s.target_size = self.target_size;
+        s.target_kb = self.target_kb;
     }
 
     /// The same look with settings that have no effect cleared (the quality of a format that's
@@ -112,6 +118,13 @@ impl Look {
         }
         if !self.resize || self.resize_mode != ResizeMode::Box {
             (self.box_width, self.box_height) = (0, 0);
+        }
+        // A target only changes JPEG, lossy WebP and AVIF, and then picks their quality.
+        let lossy = self.jpeg || (self.webp && !self.webp_lossless) || self.avif;
+        if !self.target_size || !lossy {
+            (self.target_size, self.target_kb) = (false, 0);
+        } else {
+            (self.jpeg_quality, self.webp_quality, self.avif_quality) = (0, 0, 0);
         }
         self
     }
