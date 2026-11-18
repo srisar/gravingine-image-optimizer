@@ -1,11 +1,25 @@
 use std::process::Command;
 
+/// "2026-11-07" as "7 Nov 2026" (in English, whatever the system's language). Anything else is
+/// returned as it is.
+fn readable_date(iso: &str) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let parts: Vec<&str> = iso.split('-').collect();
+    match parts[..] {
+        [year, month, day] => match (month.parse::<usize>(), day.parse::<u32>()) {
+            (Ok(m @ 1..=12), Ok(d)) => format!("{d} {} {year}", MONTHS[m - 1]),
+            _ => iso.to_string(),
+        },
+        _ => iso.to_string(),
+    }
+}
+
 fn main() {
     // The UI, compiled with Slint's Cosmic widget style.
     let config = slint_build::CompilerConfiguration::new().with_style("cosmic".into());
     slint_build::compile_with_config("ui/app.slint", config).expect("Slint UI failed to compile");
 
-    // "445e6ee · 2026-11-17": the commit this was built from and its date, for the About
+    // "445e6ee · 17 Nov 2026": the commit this was built from and its date, for the About
     // dialog. "dev" outside a git checkout.
     let git = |args: &[&str]| {
         Command::new("git")
@@ -18,7 +32,7 @@ fn main() {
             .filter(|s| !s.is_empty())
     };
     let build = match (git(&["rev-parse", "--short", "HEAD"]), git(&["log", "-1", "--format=%cs"])) {
-        (Some(commit), Some(date)) => format!("{commit} · {date}"),
+        (Some(commit), Some(date)) => format!("{commit} · {}", readable_date(&date)),
         _ => "dev".to_string(),
     };
     println!("cargo:rustc-env=GIO_BUILD={build}");
