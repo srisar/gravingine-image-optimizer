@@ -15,6 +15,17 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
+/// Restore the window if it's minimized and bring it to the front. (Windows only lets it take
+/// the foreground when allowed: the copy of the app that forwarded paths allows it.)
+pub fn bring_to_front(hwnd: HWND) {
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(hwnd);
+    }
+}
+
 /// The installed icon font: Segoe Fluent Icons (Windows 11) or Segoe MDL2 Assets (Windows 10).
 pub fn icon_font_face() -> &'static str {
     static FACE: OnceLock<&'static str> = OnceLock::new();

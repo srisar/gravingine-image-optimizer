@@ -23,7 +23,7 @@ serde_json = "1.0.154"
 slint = { version = "1.19.0", features = ["unstable-winit-030"] }
 walkdir = "2.5.0"
 webp = "0.3.1"
-winapi = { version = "0.3.9", features = ["winuser", "wingdi", "windef", "minwindef", "dwmapi", "shobjidl_core", "combaseapi", "objbase", "unknwnbase", "winerror", "wtypesbase"] }
+winapi = { version = "0.3.9", features = ["winuser", "wingdi", "windef", "minwindef", "dwmapi", "shobjidl_core", "combaseapi", "objbase", "unknwnbase", "winerror", "wtypesbase", "synchapi", "errhandlingapi", "namedpipeapi", "winbase", "fileapi", "handleapi", "processthreadsapi", "winnt"] }
 
 [build-dependencies]
 embed-resource = "3.0.9"

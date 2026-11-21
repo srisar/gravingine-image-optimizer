@@ -7,6 +7,7 @@ mod logo;
 mod metadata;
 mod optimizer;
 mod presets;
+mod single_instance;
 mod taskbar;
 mod winicon;
 
