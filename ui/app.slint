@@ -95,15 +95,28 @@ component Icon inherits Text {
     accessible-role: none;
 }
 
-// A Cosmic-looking button with an icon-font glyph before its text.
+// GitHub's mark (from Octicons), for links to the source code; the icon font has none. Set
+// `fill` for its color.
+component GitHubMark inherits Path {
+    width: 16px;
+    height: 16px;
+    viewbox-width: 16;
+    viewbox-height: 16;
+    commands: "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z";
+    accessible-role: none;
+}
+
+// A Cosmic-looking button with an icon-font glyph (or the GitHub mark) before its text.
 component GlyphButton {
     in property <string> glyph;
+    in property <bool> github;
     in property <string> text;
     in property <bool> primary;
     in property <bool> enabled: true;
     callback clicked;
 
     private property <brush> fg: root.primary ? Palette.accent-foreground : Palette.control-foreground;
+    private property <bool> has-icon: root.glyph != "" || root.github;
 
     min-height: 34px;
     horizontal-stretch: 0;
@@ -120,11 +133,15 @@ component GlyphButton {
         animate background { duration: 150ms; }
 
         HorizontalLayout {
-            padding-left: root.text == "" ? 9px : root.glyph == "" ? 18px : 14px;
-            padding-right: root.text == "" ? 9px : root.glyph == "" ? 18px : 16px;
+            padding-left: root.text == "" ? 9px : !root.has-icon ? 18px : 14px;
+            padding-right: root.text == "" ? 9px : !root.has-icon ? 18px : 16px;
             spacing: 8px;
             alignment: center;
-            if root.glyph != "": Icon {
+            if root.github: GitHubMark {
+                fill: root.fg;
+                cross-axis-self-alignment: center;
+            }
+            if root.glyph != "" && !root.github: Icon {
                 glyph: root.glyph;
                 color: root.fg;
                 font-size: 15px;
@@ -1248,8 +1265,10 @@ component CompareView inherits Rectangle {
 }
 
 // A link to a web page: accent text with an "open in new window" mark, brighter on hover.
+// With `github`, the GitHub mark comes first instead (it already says where it goes).
 component Link {
     in property <string> text;
+    in property <bool> github;
     callback clicked;
 
     private property <brush> color: touch.has-hover ? Palette.accent-background.brighter(0.25) : Palette.accent-background;
@@ -1259,14 +1278,18 @@ component Link {
     accessible-action-default => { root.clicked(); }
 
     HorizontalLayout {
-        spacing: 5px;
+        spacing: root.github ? 7px : 5px;
+        if root.github: GitHubMark {
+            fill: root.color;
+            cross-axis-self-alignment: center;
+        }
         Text {
             text: root.text;
             font-size: 13px;
             color: root.color;
             vertical-alignment: center;
         }
-        Icon {
+        if !root.github: Icon {
             glyph: Glyph.open-new;
             font-size: 11px;
             color: root.color;
@@ -1552,7 +1575,7 @@ component AboutDialog inherits Rectangle {
                         clicked => { root.licenses = true; }
                     }
                     GlyphButton {
-                        glyph: Glyph.open-new;
+                        github: true;
                         text: "Source code";
                         clicked => { root.open-source(); }
                     }
@@ -1697,21 +1720,21 @@ component AboutDialog inherits Rectangle {
                     height: 1px;
                     background: Ui.card-border;
                 }
-                HorizontalLayout {
-                    spacing: 12px;
-                    VerticalLayout {
-                        alignment: center;
-                        horizontal-stretch: 1;
-                        Text {
-                            text: "Gravingine Image Optimizer is MIT licensed. The full license texts are in each project's repository.";
-                            font-size: 12px;
-                            color: Ui.secondary;
-                            wrap: word-wrap;
-                        }
+                VerticalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: "Gravingine Image Optimizer is MIT licensed. The full license texts are in each project's repository.";
+                        font-size: 12px;
+                        color: Ui.secondary;
+                        wrap: word-wrap;
                     }
-                    Link {
-                        text: "Source code";
-                        clicked => { root.open-source(); }
+                    HorizontalLayout {
+                        alignment: start;
+                        Link {
+                            text: "Source code on GitHub";
+                            github: true;
+                            clicked => { root.open-source(); }
+                        }
                     }
                 }
             }
