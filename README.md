@@ -7,6 +7,8 @@ smaller files.
 ## Features
 
 - **Drag & drop** files or folders onto the window (or onto the `.exe` icon), or use *Add files* / *Add folder*.
+- **Right-click → Optimize with Gravingine** on images and folders in Explorer (set up by the installer; on Windows 11 it's under *Show more options*). It opens the app with them added, ready to check the settings and optimize; nothing is optimized until you click *Optimize*.
+- **One window**: starting the app again (the right-click menu, dropping on the `.exe`, the Start menu) brings the open window forward and adds the files to it. Files selected together arrive together (Explorer starts one copy per file; they're gathered for half a second), a single file opens its preview, and files added during a run wait until it finishes.
 - Folders are scanned recursively; the folder structure is preserved in the output.
 - **Presets** (top of the settings): Web, Smallest, Photos, Thumbnails, Lossless and Email set the output formats, their quality and resizing in one click. Change anything and the preset shows *Custom*; *Save as preset…* keeps your own (stored in `%APPDATA%\Gravingine Image Optimizer\presets.json`), which can be deleted again. Presets leave *Save to* as it is.
 - **Output formats** (any combination, all encoded in one pass):
@@ -70,7 +72,9 @@ It writes to `dist/`, each with a `.sha256` checksum next to it:
 - `gravingine-image-optimizer-v<version>-windows-x64-setup.exe`: the installer. It installs for
   the current user without admin rights (into `%LOCALAPPDATA%\Programs`), adds a Start menu
   shortcut and an optional desktop shortcut, and can be removed from *Settings › Apps*.
-  Upgrading closes a running copy first.
+  Upgrading closes a running copy first. A ticked-by-default option adds *Optimize with
+  Gravingine* to the right-click menu of images and folders (registry entries under
+  `HKCU\Software\Classes`, removed on uninstall or when the option is unticked on an upgrade).
 - `gravingine-image-optimizer-v<version>-windows-x64.zip`: the portable build (the exe, this
   README and the license).
 
@@ -109,7 +113,8 @@ may warn on first launch.
 - `src/presets.rs` – settings presets: the built-in ones, matching settings to a preset, and the user's own in `presets.json`
 - `src/taskbar.rs` – taskbar button progress and flash
 - `src/logo.rs` – draws the Gravingine logo: the window icon, and (via `build.rs`) the exe's embedded `.ico`
-- `src/winicon.rs` – sets the window icon, icon-font detection and title bar tint (Win32)
+- `src/winicon.rs` – sets the window icon, icon-font detection, title bar tint and bringing the window to the front (Win32)
+- `src/single_instance.rs` – one window at a time: a named mutex and a named pipe that later copies of the app hand their files to
 - `installer/gravingine.iss` – the Inno Setup installer script
 - `res/app.manifest` – embedded by `build.rs`: Common Controls v6 (system dialogs) and per-monitor DPI awareness
 - `res/gravingine-logo.svg`, `res/gravitide-icon.svg` – the app and Gravitide logos shown in the About dialog

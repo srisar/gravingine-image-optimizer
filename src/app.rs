@@ -18,7 +18,7 @@ use winapi::shared::windef::HWND;
 use crate::optimizer::{self, ColorProfile, Format, FormatResult, Metadata, OutputLocation, Outcome, ResizeMode, Settings, Source};
 use crate::taskbar::{self, Taskbar};
 use crate::presets::{self, Look, Preset};
-use crate::{AppWindow, CompareFormat, TileData, Ui, winicon};
+use crate::{AppWindow, CompareFormat, TileData, Ui, single_instance, winicon};
 
 /// One entry of the resize dropdown.
 #[derive(Clone, Copy, PartialEq)]
@@ -215,6 +215,8 @@ struct State {
     compare: Option<Compare>,
     /// The image just added on its own: its preview opens once it has been read.
     auto_preview: Option<u64>,
+    /// Paths added while a run was going: they're added when it finishes.
+    waiting: Vec<PathBuf>,
 }
 
 /// Wakes the UI thread from a worker, at most once until the UI thread has handled it.
@@ -250,6 +252,10 @@ pub struct App {
     /// Files dropped on the window, added together once the drop is complete.
     dropped: RefCell<Vec<PathBuf>>,
     drop_flush_queued: Cell<bool>,
+    /// Paths from the command line or other copies of the app, gathered for a moment: Explorer
+    /// starts one copy per selected file, and they should be added together.
+    arrived: RefCell<Vec<PathBuf>>,
+    arrival_timer: slint::Timer,
     /// Re-encodes the before / after preview once settings stop changing.
     preview_timer: slint::Timer,
     /// Last comparison load started (unique across comparisons).
@@ -274,7 +280,26 @@ fn with_app(f: impl FnOnce(&App)) {
     }
 }
 
+/// A debug build asked to render itself to a PNG (`GIO_SNAPSHOT`).
+fn snapshot_run() -> bool {
+    cfg!(any(debug_assertions, feature = "snapshot")) && std::env::var_os("GIO_SNAPSHOT").is_some()
+}
+
 pub fn run() -> Result<(), slint::PlatformError> {
+    // Files/folders passed on the command line: Explorer's "Optimize with Gravingine" (one
+    // copy per selected file), or dropped onto the .exe icon.
+    let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    // One window at a time: hand them to a copy that's already running. (Not in snapshot
+    // runs, which must open their own window whatever else is open.)
+    let listener = if snapshot_run() {
+        None
+    } else {
+        match single_instance::claim(&args) {
+            None => return Ok(()),
+            Some(listener) => listener,
+        }
+    };
+
     // The winit backend gives access to the native window (drops, taskbar, title bar).
     slint::BackendSelector::new().backend_name("winit".into()).select()?;
     let ui = AppWindow::new()?;
@@ -301,6 +326,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
         thumb_waker: Waker::new(App::poll_thumbnails),
         dropped: RefCell::new(Vec::new()),
         drop_flush_queued: Cell::new(false),
+        arrived: RefCell::new(Vec::new()),
+        arrival_timer: slint::Timer::default(),
         preview_timer: slint::Timer::default(),
         compare_request: Cell::new(0),
         presets: RefCell::new(presets::built_in().into_iter().chain(presets_path().map(|p| presets::load(&p)).unwrap_or_default()).collect()),
@@ -312,10 +339,16 @@ pub fn run() -> Result<(), slint::PlatformError> {
     app.bind();
     app.refresh_rows();
 
-    // Files/folders passed on the command line (e.g. dropped onto the .exe icon).
-    let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    if !args.is_empty() {
+    if snapshot_run() {
         app.add_paths(args);
+    } else if !args.is_empty() {
+        app.open_paths(args);
+    }
+    // Later copies' paths (or, with none, just "come to the front").
+    if let Some(listener) = listener {
+        listener.start(|paths| {
+            let _ = slint::invoke_from_event_loop(move || with_app(|a| a.on_forwarded(paths)));
+        });
     }
 
     // The native window exists once the event loop runs.
@@ -464,15 +497,50 @@ impl App {
 
     // -------------------------------------------------------------- jobs
 
+    /// Paths from the command line or another copy of the app: added together once no more
+    /// arrive for half a second (Explorer starts one copy per selected file).
+    fn open_paths(&self, paths: Vec<PathBuf>) {
+        self.arrived.borrow_mut().extend(paths);
+        self.arrival_timer.start(slint::TimerMode::SingleShot, Duration::from_millis(500), || {
+            with_app(|a| {
+                let paths = std::mem::take(&mut *a.arrived.borrow_mut());
+                if !paths.is_empty() {
+                    a.add_paths(paths);
+                }
+            })
+        });
+    }
+
+    /// Another copy of the app was started: come to the front, and take its paths (if any).
+    fn on_forwarded(&self, paths: Vec<PathBuf>) {
+        #[cfg(debug_assertions)]
+        eprintln!("forwarded: {paths:?}");
+        if let Some(hwnd) = self.hwnd() {
+            winicon::bring_to_front(hwnd);
+        }
+        if !paths.is_empty() {
+            self.open_paths(paths);
+        }
+    }
+
     fn add_paths(&self, paths: Vec<PathBuf>) {
+        let mut preview_row = None;
         {
             let mut st = self.state.borrow_mut();
             if st.run.is_some() {
+                // Added once the run finishes.
+                st.waiting.extend(paths);
+                drop(st);
+                self.sync();
                 return;
             }
             let before = st.jobs.len();
             match optimizer::collect_sources(&paths) {
                 Ok(sources) => {
+                    // A single image that's already in the list: show it anyway.
+                    if let [source] = &sources[..] {
+                        preview_row = st.jobs.iter().position(|j| j.source.path == source.path);
+                    }
                     for source in sources {
                         if st.known.insert(source.path.clone()) {
                             st.next_id += 1;
@@ -496,10 +564,11 @@ impl App {
                             self.queue_thumbnails(tx, new);
                         }
                     }
-                    st.notice = match st.jobs.len() - before {
-                        0 => "No new supported images found.".into(),
-                        1 => "Added 1 image.".into(),
-                        n => format!("Added {n} images."),
+                    st.notice = match (st.jobs.len() - before, preview_row) {
+                        (0, Some(_)) => "Already in the list.".into(),
+                        (0, None) => "No new supported images found.".into(),
+                        (1, _) => "Added 1 image.".into(),
+                        (n, _) => format!("Added {n} images."),
                     };
                 }
                 Err(e) => st.notice = format!("Couldn't add: {e:#}"),
@@ -507,6 +576,9 @@ impl App {
             st.elapsed = None;
         }
         self.refresh_rows();
+        if let Some(row) = preview_row {
+            self.open_compare(row);
+        }
     }
 
     fn clear(&self) {
@@ -709,6 +781,11 @@ impl App {
             }
             // Cancelled images go back to waiting, so rebuild every tile.
             self.refresh_rows();
+            // Images that came in during the run.
+            let waiting = std::mem::take(&mut self.state.borrow_mut().waiting);
+            if !waiting.is_empty() {
+                self.add_paths(waiting);
+            }
             #[cfg(any(debug_assertions, feature = "snapshot"))]
             snapshot::on_run_finished();
         } else {
@@ -1315,7 +1392,8 @@ fn status_text(st: &State) -> String {
     let failed = st.jobs.iter().filter(|j| row_error(j).is_some()).count();
     if let Some(run) = &st.run {
         let done = st.jobs.iter().filter(|j| j.selected && matches!(j.status, Status::Done(_) | Status::Failed(_))).count();
-        return format!("Optimizing {done} of {}…", run.total);
+        let waiting = if st.waiting.is_empty() { "" } else { " New images will be added when it's done." };
+        return format!("Optimizing {done} of {}…{waiting}", run.total);
     }
     if total == 0 {
         return if st.notice.is_empty() { "Add images to get started.".into() } else { st.notice.clone() };
