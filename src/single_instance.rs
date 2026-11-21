@@ -18,7 +18,7 @@ use winapi::um::processthreadsapi::{GetCurrentProcessId, ProcessIdToSessionId};
 use winapi::um::synchapi::CreateMutexW;
 use winapi::um::winbase::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, SECURITY_IDENTIFICATION,
 };
 use winapi::um::winnt::HANDLE;
 use winapi::um::winuser::{ASFW_ANY, AllowSetForegroundWindow};
@@ -65,7 +65,7 @@ pub fn claim(paths: &[PathBuf]) -> Option<Option<Listener>> {
         // The first copy didn't answer (stuck or closing): open a window here after all.
         return Some(None);
     }
-    Some(create_pipe(true).map(|pipe| Listener { pipe }))
+    Some(create_pipe().map(|pipe| Listener { pipe }))
 }
 
 impl Listener {
@@ -88,7 +88,7 @@ impl Listener {
                     // Something is wrong with this instance of the pipe: make a new one.
                     unsafe { CloseHandle(pipe.0) };
                     std::thread::sleep(Duration::from_millis(200));
-                    match create_pipe(false) {
+                    match create_pipe() {
                         Some(p) => pipe = p,
                         None => return,
                     }
@@ -98,10 +98,12 @@ impl Listener {
     }
 }
 
-/// The first copy's end of the pipe: inbound only, local clients only. The first instance is
-/// created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a pipe someone else made first is refused.
-fn create_pipe(first: bool) -> Option<Pipe> {
-    let open_mode = PIPE_ACCESS_INBOUND | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
+/// The first copy's end of the pipe: inbound only, local clients only, and always the only
+/// instance (`FILE_FLAG_FIRST_PIPE_INSTANCE`, also when it's remade), so a pipe someone else
+/// made first is refused. The default security lets only this user, SYSTEM and administrators
+/// write to it.
+fn create_pipe() -> Option<Pipe> {
+    let open_mode = PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE;
     let handle = unsafe {
         CreateNamedPipeW(
             wide(&pipe_name()).as_ptr(),
@@ -138,10 +140,13 @@ fn read_all(pipe: &Pipe) -> Vec<u8> {
 /// with another copy or still starting.
 fn forward(paths: &[PathBuf]) -> bool {
     use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
     let name = pipe_name();
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
-        match std::fs::OpenOptions::new().write(true).open(&name) {
+        // Identification only: whoever is listening can't act as this user.
+        let open = std::fs::OpenOptions::new().write(true).security_qos_flags(SECURITY_IDENTIFICATION).open(&name);
+        match open {
             Ok(mut pipe) => {
                 // This copy was just started by the user, so it may pass on the right to
                 // take the foreground.
