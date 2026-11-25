@@ -80,6 +80,8 @@ struct Job {
     selected: bool,
     thumb: Option<Image>,
     meta: Meta,
+    /// An SVG: converted rather than optimized (drawn at the output size, no savings shown).
+    vector: bool,
     /// Output dimensions of the last run (`None`: kept its size). Set when a run starts.
     run_dims: Option<(u32, u32)>,
 }
@@ -93,6 +95,9 @@ struct Compare {
     /// Original pixel size (upright).
     width: u32,
     height: u32,
+    /// The size the pictures are shown at: the original's, or for an SVG the size it's drawn
+    /// at for its outputs (so the original is as sharp as they are).
+    view: (u32, u32),
     /// Outputs a run saved (empty if the image hasn't been optimized yet).
     saved: Vec<CompareOutput>,
     /// Showing the live preview rather than the saved outputs.
@@ -694,7 +699,7 @@ impl App {
                 for job in st.jobs.iter_mut().filter(|j| j.selected) {
                     job.status = Status::Pending;
                     job.run_dims = match job.meta {
-                        Meta::Read { width, height, .. } => optimizer::target_size(width, height, &settings),
+                        Meta::Read { width, height, .. } => optimizer::output_size(width, height, job.vector, &settings),
                         _ => None,
                     };
                 }
@@ -810,17 +815,24 @@ impl App {
     /// Open the comparison for an image: its saved outputs if it has any that can be shown,
     /// otherwise a live preview of the current settings.
     fn open_compare(&self, row: usize) {
+        let settings = self.read_settings();
         let compare = {
             let st = self.state.borrow();
             let Some(job) = st.jobs.get(row) else { return };
             let Meta::Read { width, height, .. } = job.meta else { return };
             let saved = compare_outputs(job);
+            let drawn = match saved.is_empty() {
+                true => optimizer::output_size(width, height, job.vector, &settings),
+                false => job.run_dims,
+            };
+            let view = if job.vector { drawn.unwrap_or((width, height)) } else { (width, height) };
             Compare {
                 name: job.file_name.clone(),
                 original: job.source.path.clone(),
                 original_size: job.original_size,
                 width,
                 height,
+                view,
                 preview: saved.is_empty(),
                 saved,
                 formats: Vec::new(),
@@ -833,8 +845,8 @@ impl App {
         };
         let ui = &self.ui;
         ui.set_compare_name(compare.name.as_str().into());
-        ui.set_compare_width(compare.width as i32);
-        ui.set_compare_height(compare.height as i32);
+        ui.set_compare_width(compare.view.0 as i32);
+        ui.set_compare_height(compare.view.1 as i32);
         ui.set_compare_original_size(human_size(compare.original_size).into());
         ui.set_compare_original_dims(format!("{} × {}", compare.width, compare.height).into());
         ui.set_compare_has_saved(!compare.saved.is_empty());
@@ -941,7 +953,7 @@ impl App {
     fn load_compare(&self) {
         let settings = self.read_settings();
         let request = self.compare_request.get() + 1;
-        let (path, decoded, need_original, job, busy) = {
+        let (path, decoded, need_original, job, busy, view) = {
             let mut st = self.state.borrow_mut();
             let Some(c) = st.compare.as_mut() else { return };
             if c.in_flight.is_some() {
@@ -965,7 +977,7 @@ impl App {
             } else {
                 "Loading…"
             };
-            (c.original.clone(), c.decoded.clone(), !c.original_shown, job, busy)
+            (c.original.clone(), c.decoded.clone(), !c.original_shown, job, busy, c.view)
         };
         self.compare_request.set(request);
         let ui = &self.ui;
@@ -976,7 +988,7 @@ impl App {
                 Some(d) => Ok(d),
                 None => optimizer::Decoded::open(&path).map(Arc::new).map_err(text),
             };
-            let original = if need_original { decoded.as_ref().ok().map(|d| pixel_buffer(d.rgba())) } else { None };
+            let original = if need_original { decoded.as_ref().ok().map(|d| pixel_buffer(d.rgba_at(view))) } else { None };
             let output = match job {
                 CompareJob::Nothing => None,
                 CompareJob::Saved { path, size, quality, target } => Some(
@@ -1008,7 +1020,7 @@ impl App {
 
     fn compare_loaded(&self, result: CompareResult) {
         let settings = self.read_settings();
-        let (format, original_size, preview, again) = {
+        let (format, original_size, preview, again, vector) = {
             let mut st = self.state.borrow_mut();
             // Closed, or another image opened since.
             let Some(c) = st.compare.as_mut().filter(|c| c.original == result.original_path) else { return };
@@ -1018,7 +1030,8 @@ impl App {
             if let Ok(d) = &result.decoded {
                 c.decoded.get_or_insert_with(|| d.clone());
             }
-            (c.current.map(|i| c.formats[i]), c.original_size, c.preview, c.dirty)
+            let vector = c.decoded.as_ref().is_some_and(|d| d.is_vector());
+            (c.current.map(|i| c.formats[i]), c.original_size, c.preview, c.dirty, vector)
         };
         // "WebP at 71%" when a target file size picked the quality; otherwise the setting
         // (preview) or just the format (saved).
@@ -1040,9 +1053,12 @@ impl App {
         }
         match result.output {
             Some(Ok(OutputPixels { pixels: buffer, size, missed_target, .. })) => {
-                let larger = size >= original_size;
+                // An SVG is converted, not optimized: no saving to compare, and never skipped.
+                let larger = !vector && size >= original_size;
                 let pct = savings_pct(original_size, size).abs().round();
-                let (saving, mut detail) = if larger {
+                let (saving, mut detail) = if vector {
+                    ("converted".to_string(), "from SVG".to_string())
+                } else if larger {
                     let detail = if preview && settings.skip_if_larger {
                         "would be skipped".to_string()
                     } else {
@@ -1399,23 +1415,30 @@ fn status_text(st: &State) -> String {
         return if st.notice.is_empty() { "Add images to get started.".into() } else { st.notice.clone() };
     }
     let mut parts = Vec::new();
-    match totals(&st.jobs) {
-        Some((orig, best)) => {
+    let svgs = converted(&st.jobs);
+    let totals = totals(&st.jobs);
+    if totals.is_some() || svgs > 0 {
+        // "Saved 1.2 MB (64%): 1.9 MB → 690 KB · converted 2 SVGs", or "Converted 2 SVGs"
+        if let Some((orig, best)) = totals {
             let saved = orig.saturating_sub(best);
             let pct = if orig == 0 { 0.0 } else { saved as f64 * 100.0 / orig as f64 };
             parts.push(format!("Saved {} ({pct:.0}%): {} → {}", human_size(saved), human_size(orig), human_size(best)));
-            if let Some(secs) = st.elapsed {
-                let done = st.jobs.iter().filter(|j| matches!(j.status, Status::Done(_) | Status::Failed(_))).count();
-                parts.push(format!("{done} files in {secs:.1}s"));
+            if svgs > 0 {
+                parts.push(converted_text(svgs));
             }
-            if failed > 0 {
-                parts.push(format!("{failed} with errors"));
-            }
+        } else {
+            parts.push(capitalize(&converted_text(svgs)));
         }
-        None => {
-            let size: u64 = st.jobs.iter().map(|j| j.original_size).sum();
-            parts.push(format!("{total} image{} · {}", if total == 1 { "" } else { "s" }, human_size(size)));
+        if let Some(secs) = st.elapsed {
+            let done = st.jobs.iter().filter(|j| matches!(j.status, Status::Done(_) | Status::Failed(_))).count();
+            parts.push(format!("{done} files in {secs:.1}s"));
         }
+        if failed > 0 {
+            parts.push(format!("{failed} with errors"));
+        }
+    } else {
+        let size: u64 = st.jobs.iter().map(|j| j.original_size).sum();
+        parts.push(format!("{total} image{} · {}", if total == 1 { "" } else { "s" }, human_size(size)));
     }
     if !st.notice.is_empty() {
         parts.push(st.notice.clone());
@@ -1427,6 +1450,7 @@ fn new_job(id: u64, source: Source) -> Job {
     let original_size = std::fs::metadata(&source.path).map(|m| m.len()).unwrap_or(0);
     let file_name = source.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let folder = source.path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let vector = optimizer::is_vector_path(&source.path);
     Job {
         id,
         source,
@@ -1437,6 +1461,7 @@ fn new_job(id: u64, source: Source) -> Job {
         selected: true,
         thumb: None,
         meta: Meta::Loading,
+        vector,
         run_dims: None,
     }
 }
@@ -1470,7 +1495,7 @@ fn tile_view(job: &Job, plan: &str, settings: &Settings) -> TileData {
         Meta::Read { width, height, .. } => {
             // Waiting images follow the current settings; others show what their run used.
             let target = match job.status {
-                Status::Pending => optimizer::target_size(width, height, settings),
+                Status::Pending => optimizer::output_size(width, height, job.vector, settings),
                 _ => job.run_dims,
             };
             (dims((width, height)), target)
@@ -1514,7 +1539,7 @@ fn tile_view(job: &Job, plan: &str, settings: &Settings) -> TileData {
             } else {
                 (TONE_CAUTION, BADGE_SKIPPED)
             };
-            (result_text(results, job.original_size), tone, badge)
+            (result_text(results, job.original_size, job.vector), tone, badge)
         }
     };
     // Last line: an error, where the files went, or where the image is.
@@ -1551,14 +1576,18 @@ fn tile_view(job: &Job, plan: &str, settings: &Settings) -> TileData {
 }
 
 /// "WebP 68.7 KB (−85%) · AVIF skipped, 4% larger"
-fn result_text(results: &[FormatResult], original: u64) -> String {
+/// `vector`: the image is an SVG, converted rather than optimized, so there's no saving to
+/// show ("PNG 48.2 KB").
+fn result_text(results: &[FormatResult], original: u64, vector: bool) -> String {
     results
         .iter()
         .map(|r| match &r.outcome {
             Outcome::Written { size, .. } => {
                 // "WebP 196.8 KB (−54%) at 71%", "... at 10%: couldn't get under 200 KB"
-                let mut text =
-                    format!("{} {} ({:+.0}%)", r.format.label(), human_size(*size), -savings_pct(original, *size));
+                let mut text = format!("{} {}", r.format.label(), human_size(*size));
+                if !vector {
+                    text.push_str(&format!(" ({:+.0}%)", -savings_pct(original, *size)));
+                }
                 if let Some(q) = r.quality {
                     text.push_str(&format!(" at {q}%"));
                 }
@@ -1674,15 +1703,20 @@ fn clear_optimized(st: &mut State, secs: f32, cancelled: bool) {
         let pct = if orig == 0 { 0.0 } else { saved as f64 * 100.0 / orig as f64 };
         notice.push_str(&format!(" · saved {} ({pct:.0}%)", human_size(saved)));
     }
+    let svgs = converted(&cleared);
+    if svgs > 0 {
+        notice.push_str(&format!(" · {}", converted_text(svgs)));
+    }
     notice.push_str(&format!(" in {secs:.1}s"));
     st.notice = notice;
 }
 
 /// Total original bytes vs. total bytes of the smallest written output per finished image.
+/// SVGs are left out: they're converted, not optimized (see [`converted`]).
 fn totals(jobs: &[Job]) -> Option<(u64, u64)> {
     let mut any = false;
     let (mut orig, mut best) = (0, 0);
-    for job in jobs {
+    for job in jobs.iter().filter(|j| !j.vector) {
         if let Status::Done(results) = &job.status {
             let smallest = results
                 .iter()
@@ -1698,6 +1732,28 @@ fn totals(jobs: &[Job]) -> Option<(u64, u64)> {
         }
     }
     any.then_some((orig, best))
+}
+
+/// How many finished SVGs got at least one output written.
+fn converted(jobs: &[Job]) -> usize {
+    jobs.iter()
+        .filter(|j| j.vector)
+        .filter(|j| match &j.status {
+            Status::Done(results) => results.iter().any(|r| matches!(r.outcome, Outcome::Written { .. })),
+            _ => false,
+        })
+        .count()
+}
+
+/// "converted 3 SVGs"
+fn converted_text(n: usize) -> String {
+    format!("converted {n} SVG{}", if n == 1 { "" } else { "s" })
+}
+
+/// The text with its first letter upper-cased.
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
 fn run_jobs(work: Vec<(usize, Source)>, settings: Settings, cancel: Arc<AtomicBool>, tx: Sender<Msg>, waker: Waker) {

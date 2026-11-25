@@ -20,7 +20,7 @@
 ; Windows 11): on the app's input types (optimizer::INPUT_EXTENSIONS) and on folders.
 #define Verb "GravingineOptimize"
 #define MenuText "Optimize with Gravingine"
-#dim Exts[11] {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".avif", ".gif", ".bmp", ".tif", ".tiff", ".ico"}
+#dim Exts[13] {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".avif", ".gif", ".bmp", ".tif", ".tiff", ".ico", ".svg", ".svgz"}
 #define I
 #define Key
 
