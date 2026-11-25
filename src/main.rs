@@ -8,6 +8,7 @@ mod metadata;
 mod optimizer;
 mod presets;
 mod single_instance;
+mod svg;
 mod taskbar;
 mod winicon;
 

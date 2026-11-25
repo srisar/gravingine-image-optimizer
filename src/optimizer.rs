@@ -10,6 +10,7 @@ use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageReader, imageops::Fil
 use serde::{Deserialize, Serialize};
 
 use crate::metadata;
+use crate::svg::{self, Svg};
 
 /// Output formats the optimizer can produce.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -269,10 +270,33 @@ pub fn output_dir(src: &Source, settings: &Settings) -> PathBuf {
 /// New dimensions for a `w` x `h` image, or `None` if it should keep its size.
 /// Keeps the aspect ratio and never upscales.
 pub fn target_size(w: u32, h: u32, settings: &Settings) -> Option<(u32, u32)> {
+    let scale = resize_scale(w, h, settings)?;
+    if scale >= 1.0 {
+        return None;
+    }
+    let new = |side: u32| ((side as f64 * scale).round() as u32).max(1);
+    Some((new(w), new(h)))
+}
+
+/// Output dimensions for a `w` x `h` image (`vector`: an SVG, at its own size), or `None`
+/// if it keeps its size. Photos only ever shrink; SVGs are drawn at the size the resize
+/// settings ask for, larger or smaller, within the SVG drawing limits.
+pub fn output_size(w: u32, h: u32, vector: bool, settings: &Settings) -> Option<(u32, u32)> {
+    if !vector {
+        return target_size(w, h, settings);
+    }
+    let scale = resize_scale(w, h, settings)?;
+    let (size, _) = svg::fit((w as f64, h as f64), scale);
+    (size != (w, h)).then_some(size)
+}
+
+/// How much the resize settings scale a `w` x `h` image (below 1 shrinks it), or `None`
+/// when resizing is off or sets no limit. A side limit of 0 means none on that side.
+fn resize_scale(w: u32, h: u32, settings: &Settings) -> Option<f64> {
     if !settings.resize || w == 0 || h == 0 {
         return None;
     }
-    let limit = |max: u32, side: u32| if max == 0 { 1.0 } else { max as f64 / side as f64 };
+    let limit = |max: u32, side: u32| if max == 0 { f64::INFINITY } else { max as f64 / side as f64 };
     let scale = match settings.resize_mode {
         ResizeMode::FitWithin => limit(settings.max_width, w).min(limit(settings.max_height, h)),
         ResizeMode::Percent => settings.resize_percent.clamp(1, 100) as f64 / 100.0,
@@ -283,11 +307,7 @@ pub fn target_size(w: u32, h: u32, settings: &Settings) -> Option<(u32, u32)> {
             limit(bw, w).min(limit(bh, h))
         }
     };
-    if scale >= 1.0 {
-        return None;
-    }
-    let new = |side: u32| ((side as f64 * scale).round() as u32).max(1);
-    Some((new(w), new(h)))
+    scale.is_finite().then_some(scale)
 }
 
 /// A source image read and decoded once, ready to encode (several times, for previews).
@@ -298,6 +318,8 @@ pub struct Decoded {
     icc: Option<Vec<u8>>,
     /// The image's EXIF block, as the file has it.
     exif: Option<Vec<u8>>,
+    /// The SVG, when the source is one (`image` is then the SVG drawn at its own size).
+    svg: Option<Svg>,
 }
 
 /// What goes into an output file besides the pixels.
@@ -319,8 +341,14 @@ struct Prepared<'a> {
 impl Decoded {
     pub fn open(path: &Path) -> Result<Self> {
         let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        if svg::is_svg(&bytes) {
+            let svg = Svg::parse(&bytes)?;
+            let ((w, h), _) = svg.size();
+            let image = DynamicImage::ImageRgba8(svg.render(w, h)?);
+            return Ok(Decoded { bytes, image, icc: None, exif: None, svg: Some(svg) });
+        }
         let Picture { image, icc, exif } = decode(&bytes)?;
-        Ok(Decoded { bytes, image, icc, exif })
+        Ok(Decoded { bytes, image, icc, exif, svg: None })
     }
 
     /// Size of the original file in bytes.
@@ -328,17 +356,47 @@ impl Decoded {
         self.bytes.len() as u64
     }
 
+    /// The source is an SVG: its outputs are conversions, so "skip files larger than the
+    /// original" doesn't apply to them.
+    pub fn is_vector(&self) -> bool {
+        self.svg.is_some()
+    }
+
     /// The upright original pixels, in sRGB for the screen.
     pub fn rgba(&self) -> image::RgbaImage {
         metadata::display_rgba(&self.image, self.icc.as_deref())
     }
 
-    /// The image at the size `settings` ask for, and whether that is a resize.
-    fn resized(&self, settings: &Settings) -> (Cow<'_, DynamicImage>, bool) {
-        match target_size(self.image.width(), self.image.height(), settings) {
-            Some((w, h)) => (Cow::Owned(self.image.resize_exact(w, h, FilterType::Lanczos3)), true),
-            None => (Cow::Borrowed(&self.image), false),
+    /// The original for the screen at `size`: an SVG drawn at that size (sharp at any size);
+    /// any other image as it is ([`Decoded::rgba`]), whatever `size` is.
+    pub fn rgba_at(&self, (w, h): (u32, u32)) -> image::RgbaImage {
+        match &self.svg {
+            Some(svg) if (w, h) != (self.image.width(), self.image.height()) => {
+                svg.render(w, h).unwrap_or_else(|_| self.rgba())
+            }
+            _ => self.rgba(),
         }
+    }
+
+    /// The image at the size `settings` ask for, and whether that is a resize.
+    /// An SVG is drawn again at that size, so it stays sharp when enlarged.
+    fn resized(&self, settings: &Settings) -> (Cow<'_, DynamicImage>, bool) {
+        let (w, h) = (self.image.width(), self.image.height());
+        let Some((tw, th)) = output_size(w, h, self.is_vector(), settings) else {
+            return (Cow::Borrowed(&self.image), false);
+        };
+        let drawn = self.svg.as_ref().and_then(|svg| svg.render(tw, th).ok());
+        let image = match drawn {
+            Some(rgba) => DynamicImage::ImageRgba8(rgba),
+            None => self.image.resize_exact(tw, th, FilterType::Lanczos3),
+        };
+        (Cow::Owned(image), true)
+    }
+
+    /// The most an output may weigh to count as smaller than the original, if "skip files
+    /// larger than the original" applies (not to SVGs).
+    fn larger_than_original_limit(&self, settings: &Settings) -> Option<u64> {
+        (settings.skip_if_larger && !self.is_vector()).then_some(self.file_size())
     }
 
     /// The EXIF block outputs of `img` (this image, possibly resized) get, if any.
@@ -401,7 +459,10 @@ impl Decoded {
         };
         // With "skip files larger than the original" on, a larger output would be thrown
         // away, so it also has to come out smaller than the original.
-        let budget = if settings.skip_if_larger { target.min(self.file_size().saturating_sub(1)) } else { target };
+        let budget = match self.larger_than_original_limit(settings) {
+            Some(original) => target.min(original.saturating_sub(1)),
+            None => target,
+        };
         let at = |quality: u8| self.encode(p, format, &settings.with_quality(format, quality));
         let fits = |data: &[u8]| data.len() as u64 <= budget;
         let done = |data: Vec<u8>, quality: u8| {
@@ -462,7 +523,7 @@ pub fn preview(decoded: &Decoded, format: Format, settings: &Settings) -> Result
 /// Decode, optionally resize and encode one source to every enabled format.
 pub fn process(src: &Source, settings: &Settings) -> Result<Vec<FormatResult>> {
     let decoded = Decoded::open(&src.path)?;
-    let original_size = decoded.file_size();
+    let skip_from = decoded.larger_than_original_limit(settings);
     let (img, resized) = decoded.resized(settings);
     let exif = decoded.output_exif(&img, settings);
     let out_dir = output_dir(src, settings);
@@ -485,7 +546,7 @@ pub fn process(src: &Source, settings: &Settings) -> Result<Vec<FormatResult>> {
                 Err(e) => Outcome::Failed(format!("{e:#}")),
                 Ok(Encoded { data, .. }) => {
                     let size = data.len() as u64;
-                    if settings.skip_if_larger && size >= original_size {
+                    if skip_from.is_some_and(|original| size >= original) {
                         Outcome::Larger { size }
                     } else {
                         let path = out_dir.join(format!("{stem}.{}", format.extension()));
@@ -558,6 +619,16 @@ pub struct Thumbnail {
 
 pub fn thumbnail(path: &Path, size: u32) -> Result<Thumbnail> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if svg::is_svg(&bytes) {
+        let svg = Svg::parse(&bytes)?;
+        let ((width, height), limited) = svg.size();
+        // Drawn just big enough to cover the square (sharp, even for a tiny icon), then cropped.
+        let ((cw, ch), _) = svg::fit((width as f64, height as f64), size as f64 / width.min(height) as f64);
+        let cover = DynamicImage::ImageRgba8(svg.render(cw, ch)?);
+        let small = cover.resize_to_fill(size, size, FilterType::Triangle).to_rgba8();
+        let format = if limited { "SVG, too large: drawn smaller" } else { "SVG" };
+        return Ok(Thumbnail { size: small.width(), rgba: small.into_raw(), width, height, format });
+    }
     let format = match image::guess_format(&bytes) {
         Ok(image::ImageFormat::Jpeg) => "JPEG",
         Ok(image::ImageFormat::Png) => "PNG",
@@ -580,6 +651,11 @@ pub fn thumbnail(path: &Path, size: u32) -> Result<Thumbnail> {
 /// for previews.
 pub fn load_rgba(path: &Path) -> Result<image::RgbaImage> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if svg::is_svg(&bytes) {
+        let svg = Svg::parse(&bytes)?;
+        let ((w, h), _) = svg.size();
+        return svg.render(w, h);
+    }
     let Picture { image, icc, .. } = decode(&bytes)?;
     Ok(metadata::display_rgba(&image, icc.as_deref()))
 }
@@ -783,12 +859,26 @@ fn encode_png(img: &DynamicImage, original_png: Option<&[u8]>, level: u8, extras
 }
 
 /// Extensions we accept as input.
-pub const INPUT_EXTENSIONS: &[&str] = &["jpg", "jpeg", "jfif", "png", "webp", "avif", "gif", "bmp", "tif", "tiff", "ico"];
+pub const INPUT_EXTENSIONS: &[&str] =
+    &["jpg", "jpeg", "jfif", "png", "webp", "avif", "gif", "bmp", "tif", "tiff", "ico", "svg", "svgz"];
 
-pub fn is_supported(path: &Path) -> bool {
+/// Of those, the vector (SVG) ones.
+const VECTOR_EXTENSIONS: &[&str] = &["svg", "svgz"];
+
+fn has_extension(path: &Path, list: &[&str]) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| INPUT_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+        .is_some_and(|e| list.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+pub fn is_supported(path: &Path) -> bool {
+    has_extension(path, INPUT_EXTENSIONS)
+}
+
+/// The file is an SVG (by its name): it's converted rather than optimized, so the list shows
+/// no savings for it.
+pub fn is_vector_path(path: &Path) -> bool {
+    has_extension(path, VECTOR_EXTENSIONS)
 }
 
 /// Expand dropped files/folders into image sources.
@@ -1207,6 +1297,74 @@ mod tests {
             let shown = preview(&decoded, Format::Png, &settings).unwrap().pixels.get_pixel(0, 0).0;
             assert!(close(shown, on_screen, 1), "{color_profile:?}: {shown:?} vs {on_screen:?}");
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A 24 x 12 SVG: an opaque red square on the left, transparent on the right.
+    const LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12" viewBox="0 0 24 12">
+        <rect width="12" height="12" fill="#ff0000"/>
+    </svg>"##;
+
+    #[test]
+    fn svgs_are_drawn_at_the_size_the_settings_ask_for() {
+        let fit = |w, h| Settings { resize: true, max_width: w, max_height: h, ..Settings::default() };
+        let preset = |w, h| Settings { resize: true, resize_mode: ResizeMode::Box, box_width: w, box_height: h, ..Settings::default() };
+        let pct = |p| Settings { resize: true, resize_mode: ResizeMode::Percent, resize_percent: p, ..Settings::default() };
+        // Enlarged as well as shrunk.
+        assert_eq!(output_size(24, 12, true, &fit(512, 512)), Some((512, 256)));
+        assert_eq!(output_size(24, 12, true, &fit(0, 120)), Some((240, 120)));
+        assert_eq!(output_size(24, 12, true, &preset(640, 480)), Some((640, 320)));
+        assert_eq!(output_size(2400, 1200, true, &fit(240, 240)), Some((240, 120)));
+        assert_eq!(output_size(2400, 1200, true, &pct(50)), Some((1200, 600)));
+        // Already the right size, no limit set, or resizing off.
+        assert_eq!(output_size(512, 256, true, &fit(512, 512)), None);
+        assert_eq!(output_size(24, 12, true, &fit(0, 0)), None);
+        assert_eq!(output_size(24, 12, true, &Settings::default()), None);
+        // Within the drawing limits.
+        assert_eq!(output_size(24, 12, true, &fit(100_000, 0)), Some((svg::MAX_SIDE, svg::MAX_SIDE / 2)));
+        // Photos still only shrink.
+        assert_eq!(output_size(24, 12, false, &fit(512, 512)), None);
+        assert_eq!(output_size(2400, 1200, false, &fit(240, 240)), Some((240, 120)));
+    }
+
+    #[test]
+    fn svgs_are_converted_to_every_format() {
+        let dir = temp_dir("svg");
+        fs::write(dir.join("logo.svg"), LOGO_SVG).unwrap();
+        let sources = collect_sources(std::slice::from_ref(&dir)).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(is_vector_path(&sources[0].path));
+
+        // Every output is far bigger than the 200-byte SVG, but "skip files larger than the
+        // original" doesn't apply to conversions.
+        let settings = Settings {
+            jpeg: true,
+            webp: true,
+            avif: true,
+            png: true,
+            avif_speed: 10,
+            skip_if_larger: true,
+            resize: true,
+            max_width: 240,
+            max_height: 240,
+            ..Settings::default()
+        };
+        for r in process(&sources[0], &settings).unwrap() {
+            let Outcome::Written { path, .. } = &r.outcome else { panic!("{:?}: {:?}", r.format, r.outcome) };
+            let img = load_rgba(path).unwrap();
+            assert_eq!(img.dimensions(), (240, 120), "{:?} drawn at the resize size", r.format);
+            let left = img.get_pixel(60, 60).0;
+            assert!(left[0] > 200 && left[1] < 60 && left[2] < 60 && left[3] == 255, "{:?}: {left:?}", r.format);
+            let right = img.get_pixel(180, 60).0;
+            match r.format {
+                // JPEG has no transparency: white behind it.
+                Format::Jpeg => assert!(right[..3].iter().all(|&c| c > 245), "{right:?}"),
+                _ => assert_eq!(right[3], 0, "{:?} keeps transparency", r.format),
+            }
+        }
+
+        let thumb = thumbnail(&sources[0].path, 64).unwrap();
+        assert_eq!((thumb.width, thumb.height, thumb.format), (24, 12, "SVG"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

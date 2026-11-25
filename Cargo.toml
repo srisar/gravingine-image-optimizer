@@ -16,6 +16,7 @@ mozjpeg = "0.10.13"
 oxipng = { version = "10.2.1", default-features = false, features = ["parallel"] }
 ravif = "0.13.0"
 rayon = "1.12.0"
+resvg = { version = "0.49.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images", "svgz"] }
 rfd = "0.16"
 rgb = "0.8.53"
 serde = { version = "1.0.229", features = ["derive"] }

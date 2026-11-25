@@ -18,13 +18,13 @@ smaller files.
   | WebP | libwebp (lossy or lossless) | Supports transparency |
   | AVIF | ravif / rav1e | Smallest files, slower to encode |
   | PNG  | oxipng (lossless) | Re-compresses PNGs in place when not resized |
-- **Resize** with presets: Thumbnails (230 × 230), Small (640 × 480), Medium (800 × 600), Large (1024 × 768), HD (1920 × 1080) and 4K (3840 × 2160), which fit the image within the size turned to its orientation (a portrait photo fits 480 × 640 for Small); or reduce to 25%, 50% or 75%; or a custom maximum width/height or percentage. The aspect ratio is kept and images are never enlarged.
+- **Resize** with presets: Thumbnails (230 × 230), Small (640 × 480), Medium (800 × 600), Large (1024 × 768), HD (1920 × 1080) and 4K (3840 × 2160), which fit the image within the size turned to its orientation (a portrait photo fits 480 × 640 for Small); or reduce to 25%, 50% or 75%; or a custom maximum width/height or percentage. The aspect ratio is kept and images are never enlarged (except SVGs, which are drawn at the size asked for).
 - **Target file size** (e.g. "keep each file under 200 KB"): for JPEG, lossy WebP and AVIF, a binary search over quality picks the highest quality that fits (within 2 points, from 100% down to 10%; the quality sliders are set aside while a target is on). With *Skip files larger than the original* on, it also stays smaller than the original, so the output isn't thrown away. Tiles and the preview show the quality picked ("WebP 196.8 KB at 71%"); an image that doesn't fit even at 10% is still saved, at its smallest, and flagged in amber. PNG and lossless WebP aren't changed. Presets can include a target.
 - **Color profile and metadata** (settings, under *Advanced settings* at the bottom):
   - *Color profile*: **Keep** (default) embeds a wide-gamut profile (Display P3, Adobe RGB...) in JPEG, WebP and PNG, so those photos keep their colors; an sRGB profile is left out since untagged images are read as sRGB anyway. AVIF, whose encoder can't embed a profile, is converted to sRGB. **Convert to sRGB** converts the pixels (with [moxcms](https://github.com/awxkee/moxcms)) and embeds no profile. Previews and thumbnails are color-managed either way.
   - *Metadata*: **Remove all** (default), **Keep, except location** (camera, lens, exposure, dates, author, copyright) or **Keep all** (with GPS). The EXIF block is rebuilt rather than copied: maker notes and the embedded thumbnail are always dropped, as are XMP and IPTC, and the pixel dimensions are updated. It counts toward a target file size.
   - EXIF orientation is always applied to the pixels (and never written), so photos come out upright. AVIF inputs' own profile and metadata aren't read.
-- *Skip outputs larger than the original* so you never end up with a worse file.
+- *Skip outputs larger than the original* so you never end up with a worse file (it doesn't apply to SVGs, whose outputs are conversions).
 - *Clear images from the list once optimized* (under *Save to*): after a run, images that optimized cleanly leave the list and their savings go into the status line; images with errors or a missed target size stay, so you can look at them.
 - File list as tiles: thumbnail with a status badge, file name and format, what will be produced (or the colored result) and where it was saved, with a progress bar while optimizing. On the right, *Original* and *Output* columns: dimensions and file size before, and the resized dimensions and smallest saved size after. Tick the images to process with their checkboxes; *Select all* / *Select none*.
 - **Before / after preview**: adding a single image opens it straight away; otherwise clicking a tile (or its eye button) opens the original and an output side by side with a split line you drag across, both drawn at the same size so quality is what you compare. Before optimizing, it's a live preview: the current settings are encoded in memory (nothing is saved), and moving a slider or switching a format re-encodes it, so you can tune by eye and then click *Optimize*. Optimized images can switch between *Saved* (the files written) and *Preview*. Choose the format and the zoom (*Fit*, 25%, 50%, 75% or 100%; drag to pan when the picture is bigger than the view); Esc closes it. Every format can be previewed, AVIF included (decoded with [avif-decode](https://github.com/kornelski/avif-decode), pure Rust on the rav1d AV1 decoder).
@@ -37,7 +37,15 @@ smaller files.
   - the file list highlights while files are dragged over the window;
   - scales per monitor; icons are glyphs from the Windows icon font (Segoe Fluent Icons, or Segoe MDL2 Assets on Windows 10). The window and taskbar icon is the Gravingine logo, drawn at runtime.
 
-Inputs: jpg, jpeg, jfif, png, webp, avif, gif, bmp, tif, tiff, ico.
+Inputs: jpg, jpeg, jfif, png, webp, avif, gif, bmp, tif, tiff, ico, svg, svgz.
+
+**SVG** (and gzipped SVGZ) files are converted to the chosen formats, drawn with [resvg](https://github.com/linebender/resvg):
+
+- They're drawn at their own size (`width`/`height`, or the `viewBox`), or with resizing on, straight at the size it asks for, larger or smaller, so they stay sharp. At most 16,384 px a side (and 512 MB of pixels): a bigger SVG is drawn smaller, and its tile says so.
+- Transparency is kept in PNG, WebP and AVIF; JPEG gets white behind it.
+- Text uses the fonts installed on Windows (loaded the first time an SVG is opened).
+- Only what's in the file is drawn: embedded images are, links to other files or the web aren't, so an SVG from elsewhere can't pull a file from your PC into an output.
+- Their tiles show the output sizes without a percentage, and they're left out of the *Saved* total (the status line says "converted 3 SVGs").
 
 ## Output location
 
@@ -109,6 +117,7 @@ may warn on first launch.
 - `ui/app.slint` – the whole window: settings cards, file list tiles, toolbar and footer (compiled by `build.rs` with the Cosmic style)
 - `src/app.rs` – app state and behavior: adding images, thumbnails, selection, runs, window events
 - `src/optimizer.rs` – decoding, resizing and encoding
+- `src/svg.rs` – SVG input: recognizing, parsing (links to other files refused) and drawing SVGs at any size
 - `src/metadata.rs` – color profiles (sRGB detection and conversion) and EXIF (rebuilt with only the fields kept), and adding them to JPEG, WebP and PNG files
 - `src/presets.rs` – settings presets: the built-in ones, matching settings to a preset, and the user's own in `presets.json`
 - `src/taskbar.rs` – taskbar button progress and flash
