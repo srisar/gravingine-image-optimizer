@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "gravingine_image_optimizer"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "avif-decode",
